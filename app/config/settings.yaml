@@ -1,0 +1,62 @@
+app:
+  host: "0.0.0.0"
+  port: 8000
+  workers: 4
+  timeout: 30
+  reload: false
+
+logging:
+  level: "INFO"
+  format: "json"
+  pii_sanitization: true
+
+llm:
+  base_url: "https://api.deepseek.com"
+  api_key: "${DEEPSEEK_API_KEY}"
+  model: "deepseek-chat"
+  timeout: 30
+  max_retries: 3
+  retry_delay: 1
+
+redis:
+  host: "localhost"
+  port: 6379
+  db: 0
+  password: "${REDIS_PASSWORD}"
+  max_connections: 100
+  socket_timeout: 5
+  socket_connect_timeout: 5
+
+rate_limit:
+  enabled: true
+  default_rps: 1000
+  burst: 2000
+  key_prefix: "pii_gateway:ratelimit:"
+
+detector:
+  natasha:
+    enabled: true
+    confidence_threshold: 0.85
+  presidio:
+    enabled: true
+    confidence_threshold: 0.8
+    language: "ru"
+  regex:
+    enabled: true
+  composite:
+    strategy: "priority"  # priority | union | intersection
+    deduplicate: true
+    min_confidence: 0.75
+
+masker:
+  token_prefix: "["
+  token_suffix: "]"
+  token_format: "{type}_{index}"  # e.g., FIO_1, PASSPORT_2
+  preserve_case: false
+  preserve_length: false
+
+pipeline:
+  max_text_length: 100000
+  max_entities_per_request: 500
+  llm_timeout: 25
+  total_timeout: 28

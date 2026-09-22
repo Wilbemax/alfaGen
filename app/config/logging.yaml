@@ -1,0 +1,86 @@
+version: 1
+disable_existing_loggers: false
+
+formatters:
+  json:
+    class: pythonjsonlogger.jsonlogger.JsonFormatter
+    format: "%(timestamp)s %(level)s %(logger)s %(message)s %(module)s %(funcName)s %(lineno)d"
+    rename_fields:
+      timestamp: "timestamp"
+      level: "level"
+      logger: "logger"
+      message: "message"
+  console:
+    class: logging.Formatter
+    format: "%(asctime)s | %(levelname)-8s | %(name)s | %(message)s"
+    datefmt: "%Y-%m-%d %H:%M:%S"
+
+filters:
+  pii_sanitizer:
+    class: app.utils.sanitizer.PIISanitizingFilter
+    pii_patterns: !ENV ${PII_PATTERNS:}
+
+handlers:
+  console:
+    class: logging.StreamHandler
+    level: INFO
+    formatter: console
+    stream: ext://sys.stdout
+    filters: ["pii_sanitizer"]
+
+  json_console:
+    class: logging.StreamHandler
+    level: INFO
+    formatter: json
+    stream: ext://sys.stdout
+    filters: ["pii_sanitizer"]
+
+  file:
+    class: logging.handlers.RotatingFileHandler
+    level: INFO
+    formatter: json
+    filename: /var/log/pii-gateway/app.log
+    maxBytes: 104857600
+    backupCount: 10
+    encoding: utf-8
+    filters: ["pii_sanitizer"]
+
+  error_file:
+    class: logging.handlers.RotatingFileHandler
+    level: ERROR
+    formatter: json
+    filename: /var/log/pii-gateway/error.log
+    maxBytes: 104857600
+    backupCount: 10
+    encoding: utf-8
+    filters: ["pii_sanitizer"]
+
+loggers:
+  app:
+    level: INFO
+    handlers: ["json_console", "file"]
+    propagate: false
+
+  uvicorn:
+    level: INFO
+    handlers: ["json_console"]
+    propagate: false
+
+  uvicorn.access:
+    level: INFO
+    handlers: ["json_console"]
+    propagate: false
+
+  httpx:
+    level: WARNING
+    handlers: ["json_console"]
+    propagate: false
+
+  redis:
+    level: WARNING
+    handlers: ["json_console"]
+    propagate: false
+
+root:
+  level: INFO
+  handlers: ["json_console"]

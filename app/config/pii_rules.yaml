@@ -1,0 +1,161 @@
+# Конфигурация правил ПДн для разных system_id
+# Каждый system_id может иметь свои правила детекции/маскирования
+
+default: &default
+  # Включенные типы ПДн для детекции
+  enabled_entity_types:
+    - "PERSON"           # ФИО
+    - "DATE_OF_BIRTH"    # Дата рождения
+    - "PLACE_OF_BIRTH"   # Место рождения
+    - "PASSPORT_SERIES"  # Серия паспорта
+    - "PASSPORT_NUMBER"  # Номер паспорта
+    - "PASSPORT_ISSUER"  # Орган выдавший паспорт
+    - "PASSPORT_DEPT_CODE" # Код подразделения
+    - "PASSPORT_ISSUE_DATE" # Дата выдачи паспорта
+    - "CITIZENSHIP"      # Гражданство
+    - "DRIVER_LICENSE"   # Водительское удостоверение
+    - "ADDRESS"          # Адрес (полный)
+    - "ADDRESS_PARTIAL"  # Адрес (частичный)
+    - "EMAIL"            # Email
+    - "PHONE"            # Номер телефона
+    - "INN"              # ИНН
+    - "BANK_CARD"        # Номер банковской карты
+    - "CARD_CVV"         # CVV
+    - "CARD_PIN"         # Пин-код карты
+    - "CARD_HOLDER"      # Имя держателя карты
+
+  # Исключения (не считать ПДн)
+  exclusions:
+    # Исторические личности (ФИО не маскируем)
+    historical_persons:
+      - "Пушкин"
+      - "Лермонтов"
+      - "Толстой"
+      - "Достоевский"
+      - "Чехов"
+      - "Гоголь"
+      - "Тургенев"
+      - "Бунин"
+      - "Шолохов"
+      - "Пастернак"
+      - "Солженицын"
+      - "Бродский"
+      - "Ахматова"
+      - "Цветаева"
+      - "Маяковский"
+      - "Есенин"
+      - "Блок"
+      - "Горький"
+      - "Ленин"
+      - "Сталин"
+      - "Хрущев"
+      - "Брежнев"
+      - "Горбачев"
+      - "Ельцин"
+      - "Путин"
+      - "Медведев"
+      - "Навальный"
+      - "Шойгу"
+      - "Лавров"
+      - "Мишустин"
+
+    # Адреса отделений банка (не маскируем)
+    bank_branches:
+      - "офис"
+      - "отделение"
+      - "филиал"
+      - "банк"
+      - "сбербанк"
+      - "альфа-банк"
+      - "втб"
+      - "газпромбанк"
+      - "т-банк"
+      - "райффайзен"
+      - "росбанк"
+      - "открытие"
+      - "доманс"
+      - "мкб"
+
+    # Паттерны для исключения адресов банков
+    bank_address_patterns:
+      - "(?i)ул\\.?\\s*[А-Яа-я\\s]+\\d+.*(офис|отделение|филиал|банк)"
+      - "(?i)(офис|отделение|филиал)\\s*\\d+.*ул\\.?\\s*[А-Яа-я\\s]+\\d+"
+
+  # Настройки маскирования для конкретных типов
+  masking_rules:
+    PERSON:
+      token_format: "FIO_{index}"
+      preserve_first_letter: false
+    PASSPORT_SERIES:
+      token_format: "PASSPORT_SERIES_{index}"
+    PASSPORT_NUMBER:
+      token_format: "PASSPORT_NUMBER_{index}"
+    BANK_CARD:
+      token_format: "CARD_{index}"
+      preserve_last4: true
+    CARD_CVV:
+      token_format: "CVV_{index}"
+    CARD_PIN:
+      token_format: "PIN_{index}"
+    EMAIL:
+      token_format: "EMAIL_{index}"
+      preserve_domain: true
+    PHONE:
+      token_format: "PHONE_{index}"
+      preserve_country_code: true
+
+# Конфигурация для конкретных систем-потребителей
+systems:
+  "crm-system":
+    <<: *default
+    enabled_entity_types:
+      - "PERSON"
+      - "PHONE"
+      - "EMAIL"
+      - "ADDRESS"
+      - "INN"
+    masking_rules:
+      PERSON:
+        token_format: "CLIENT_{index}"
+
+  "loan-scoring":
+    <<: *default
+    enabled_entity_types:
+      - "PERSON"
+      - "PASSPORT_SERIES"
+      - "PASSPORT_NUMBER"
+      - "PASSPORT_ISSUER"
+      - "PASSPORT_DEPT_CODE"
+      - "PASSPORT_ISSUE_DATE"
+      - "INN"
+      - "BANK_CARD"
+      - "PHONE"
+      - "ADDRESS"
+    masking_rules:
+      BANK_CARD:
+        token_format: "CREDIT_CARD_{index}"
+        preserve_last4: true
+
+  "support-chat":
+    <<: *default
+    enabled_entity_types:
+      - "PERSON"
+      - "PHONE"
+      - "EMAIL"
+      - "BANK_CARD"
+      - "CARD_CVV"
+      - "CARD_PIN"
+    masking_rules:
+      CARD_CVV:
+        token_format: "SECURE_CVV_{index}"
+      CARD_PIN:
+        token_format: "SECURE_PIN_{index}"
+
+  "document-processing":
+    <<: *default
+    # Все типы включены
+    masking_rules:
+      PERSON:
+        token_format: "PERSON_{index}"
+      ADDRESS:
+        token_format: "ADDR_{index}"
