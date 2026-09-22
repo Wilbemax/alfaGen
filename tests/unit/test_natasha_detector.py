@@ -348,10 +348,69 @@ async def test_location_inside_issuer_is_not_expanded_to_whole_phrase() -> None:
 
     matches = await detector.detect(text)
 
-    assert len(matches) == 1
-    assert matches[0].entity_type == "ADDRESS"
-    assert matches[0].text == "г. Москве"
-    assert matches[0].text == text[matches[0].start:matches[0].end]
+    assert not any(match.entity_type == "ADDRESS" for match in matches)
+
+
+@pytest.mark.asyncio
+async def test_structured_address_supports_extended_components() -> None:
+    text = (
+        "проживает: Республика Татарстан, г. Казань, пр-т Победы, д. 10, "
+        "корп. 2, стр. 1, кв. 5"
+    )
+    address = text.removeprefix("проживает: ")
+    location = "Казань"
+    start = text.index(location)
+    detector = NatashaDetector(
+        ner_runner=_runner([(start, start + len(location), "LOC", 0.9)])
+    )
+    await detector.initialize()
+
+    matches = await detector.detect(text)
+    addresses = [match for match in matches if match.entity_type == "ADDRESS"]
+
+    assert len(addresses) == 1
+    match = addresses[0]
+    assert match.text == address
+    assert match.start == text.index(address)
+    assert match.end == len(text)
+    assert match.text == text[match.start:match.end]
+
+
+@pytest.mark.asyncio
+async def test_structured_address_supports_region_and_road_components() -> None:
+    text = (
+        "проживает: Московская область, Одинцовский район, г. Одинцово, "
+        "Можайское шоссе, д. 1"
+    )
+    address = text.removeprefix("проживает: ")
+    location = "Одинцово"
+    start = text.index(location)
+    detector = NatashaDetector(
+        ner_runner=_runner([(start, start + len(location), "LOC", 0.9)])
+    )
+    await detector.initialize()
+
+    matches = await detector.detect(text)
+    addresses = [match for match in matches if match.entity_type == "ADDRESS"]
+
+    assert len(addresses) == 1
+    match = addresses[0]
+    assert match.text == address
+    assert match.start == text.index(address)
+    assert match.end == len(text)
+    assert match.text == text[match.start:match.end]
+
+
+@pytest.mark.asyncio
+async def test_region_without_address_context_is_dropped() -> None:
+    text = "Республика Татарстан отметила праздник"
+    location = "Республика Татарстан"
+    detector = NatashaDetector(
+        ner_runner=_runner([(0, len(location), "LOC", 0.9)])
+    )
+    await detector.initialize()
+
+    assert await detector.detect(text) == []
 
 
 @pytest.mark.asyncio

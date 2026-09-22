@@ -23,20 +23,34 @@ NerRunner = Callable[[str], list[tuple[int, int, str, float]]]
 
 _NAME_SIGNAL = re.compile(r"(?iu)(?<![\w])[а-яё]{2,}(?:\s+[а-яё]{2,})+")
 _ADDRESS_SIGNAL = re.compile(
-    r"(?iu)(?:проживает|индекс|улиц\w*|проспект\w*|город\w*"
-    r"|(?<![\w])ул\.?|(?<![\w])д\.|(?<![\w])дом\b|(?<![\w])кв\.?|(?<![\w])г\.)"
+    r"(?iu)(?:проживает|адрес|индекс|улиц\w*|проспект\w*|город\w*"
+    r"|корпус\w*|строени\w*|квартир\w*|област\w*|район\w*"
+    r"|республик\w*|край\b|шоссе\b|переулок\w*"
+    r"|(?<![\w])ул\.?|(?<![\w])пр-т\b|(?<![\w])д\."
+    r"|(?<![\w])дом\b|(?<![\w])кв\.?|(?<![\w])корп\."
+    r"|(?<![\w])стр\.?|(?<![\w])обл\.?|(?<![\w])р-н\b"
+    r"|(?<![\w])пер\.?|(?<![\w])г\.)"
+)
+_DIRECT_ADDRESS_SPAN_SIGNAL = re.compile(
+    r"(?iu)(?:улиц\w*|проспект\w*|шоссе\b|переулок\w*"
+    r"|(?<![\w])ул\.?|(?<![\w])пр-т\b|(?<![\w])пер\.?"
+    r"|(?<![\w])г\.|город\w*)"
 )
 _BIRTH_CUES = ("место рождения", "родился", "родилась")
 _ISSUER_CUES = ("выдан", "выдано", "уфмс", "оуфмс", "мвд", "овд")
 _SERVICE_PREFIX = re.compile(r"(?iu)(?:поэт|клиент|уважаемый)\s+")
 _ISSUER_PREFIX = re.compile(r"(?iu)(?:выдан|выдано)\s+")
 _PLACE_LEFT = re.compile(
-    r"(?iu)(?:городе|город|г\.|улица|ул\.?|проспект)\s+$"
+    r"(?iu)(?:городе|город|г\.|улица|ул\.?|проспект|пр-т|шоссе"
+    r"|переулок|пер\.?|область|обл\.?|район|р-н|республика|край)\s+$"
 )
 _ADDRESS_SERVICE_PREFIX = re.compile(r"(?iu)\bпроживает\b[ \t]*:[ \t]*")
 _STRUCTURED_ADDRESS_COMPONENT = re.compile(
-    r"(?iu)^(?:\d{6}|(?:г\.?|город|ул\.?|улица|проспект|д\.?|дом|кв\.?|индекс)"
-    r"(?:\s|$))"
+    r"(?iu)^(?:\d{6}"
+    r"|(?:г\.?|город|ул\.?|улица|проспект|пр-т|д\.?|дом|корп\.?|корпус"
+    r"|стр\.?|строение|кв\.?|квартира|индекс|обл\.?|область|район|р-н"
+    r"|республика|край|шоссе|переулок|пер\.?)(?=[ \t]|$)"
+    r"|[а-яё][а-яё .-]*[ \t]+(?:область|район|край|шоссе|переулок)\b)"
 )
 
 
@@ -246,7 +260,18 @@ def _address_cue_for_span(text: str, start: int, end: int) -> bool:
     """Адресный признак берётся у самого спана, а не у всей фразы."""
     left = text[max(0, start - 20) : start]
     span = text[start:end]
-    return _ADDRESS_SIGNAL.search(left) is not None or _ADDRESS_SIGNAL.search(span) is not None
+    wider_left = text[max(0, start - 40) : start].casefold()
+    has_issuer_context = any(cue in wider_left for cue in _ISSUER_CUES)
+    has_strong_address_context = re.search(
+        r"(?iu)(?:проживает|адрес|индекс|улиц\w*|проспект\w*|ул\.?|пр-т|шоссе|переулок)",
+        left,
+    ) is not None
+    if has_issuer_context and not has_strong_address_context:
+        return False
+    return (
+        _ADDRESS_SIGNAL.search(left) is not None
+        or _DIRECT_ADDRESS_SPAN_SIGNAL.search(span) is not None
+    )
 
 
 def _expand_place_left(text: str, start: int) -> int:
