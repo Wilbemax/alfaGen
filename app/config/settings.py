@@ -18,7 +18,7 @@ class AppSettings(BaseSettings):
     # App
     host: str = "0.0.0.0"
     port: int = 8000
-    workers: int = 4
+    workers: int = 1
     timeout: int = 30
     reload: bool = False
 
@@ -41,22 +41,24 @@ class AppSettings(BaseSettings):
     redis_db: int = 0
     redis_password: str | None = None
     redis_max_connections: int = 100
-    redis_socket_timeout: int = 5
-    redis_socket_connect_timeout: int = 5
+    redis_socket_timeout: float = 0.2
+    redis_socket_connect_timeout: float = 0.2
 
     # Rate Limit
     rate_limit_enabled: bool = True
-    rate_limit_default_rps: int = 1000
+    rate_limit_default_rps: int = 1500
     rate_limit_burst: int = 2000
     rate_limit_key_prefix: str = "pii_gateway:ratelimit:"
 
     # Payload store
     payload_store_ttl_seconds: int = 3600
     payload_store_key_prefix: str = "pii_gateway:payload:"
+    payload_store_key: str = ""
 
     # Detector
     natasha_enabled: bool = True
     natasha_confidence_threshold: float = 0.85
+    natasha_deadline_seconds: float = 0.3
     presidio_enabled: bool = True
     presidio_confidence_threshold: float = 0.8
     presidio_language: str = "ru"
@@ -82,6 +84,9 @@ class AppSettings(BaseSettings):
     config_dir: Path = Field(default_factory=lambda: Path(__file__).parent)
     pii_rules_path: Path = Field(default_factory=lambda: Path(__file__).parent / "pii_rules.yaml")
     logging_config_path: Path = Field(default_factory=lambda: Path(__file__).parent / "logging.yaml")
+
+    # Uvicorn
+    uvicorn_workers: int = Field(default=1, alias="UVICORN_WORKERS")
 
     @field_validator("composite_strategy")
     @classmethod
@@ -124,6 +129,36 @@ class PIIRulesConfig(BaseSettings):
         system_config = self.systems.get(system_id, {})
         # Глубокое слияние с default
         return self._deep_merge(self.default, system_config)
+
+    def get_system_profile(self, system_id: str | None) -> dict[str, Any]:
+        """Профиль системы: глубокий мерж default и конфигурации системы."""
+        if system_id is None:
+            return self._deep_merge(
+                self.default,
+                {"enabled": True, "demask_enabled": True},
+            )
+        if system_id in self.systems:
+            return self._deep_merge(self.default, self.systems[system_id])
+        return {"enabled": False, "demask_enabled": False, "enabled_entity_types": []}
+
+    def is_enabled(self, system_id: str | None) -> bool:
+        """Включена ли система (для None — всегда True)."""
+        if system_id is None:
+            return True
+        profile = self.get_system_profile(system_id)
+        return bool(profile.get("enabled", False))
+
+    def can_unmask(self, system_id: str | None) -> bool:
+        """Разрешено ли демаскирование (для None — всегда True)."""
+        if system_id is None:
+            return True
+        profile = self.get_system_profile(system_id)
+        return bool(profile.get("demask_enabled", False))
+
+    def get_enabled_types(self, system_id: str | None) -> set[str]:
+        """Множество включённых типов ПДн для системы."""
+        profile = self.get_system_profile(system_id)
+        return set(profile.get("enabled_entity_types", []))
 
     @staticmethod
     def _deep_merge(base: dict, override: dict) -> dict:

@@ -2,6 +2,8 @@
 # Каждый system_id может иметь свои правила детекции/маскирования
 
 default: &default
+  enabled: true
+  demask_enabled: true
   # Включенные типы ПДн для детекции
   enabled_entity_types:
     - "PERSON"           # ФИО
@@ -82,6 +84,13 @@ default: &default
       - "(?i)ул\\.?\\s*[А-Яа-я\\s]+\\d+.*(офис|отделение|филиал|банк)"
       - "(?i)(офис|отделение|филиал)\\s*\\d+.*ул\\.?\\s*[А-Яа-я\\s]+\\d+"
 
+    # Служебные слова, которые не входят в спан PERSON
+    service_words:
+      - "поэт"
+      - "клиент"
+      - "уважаемый"
+      - "район"
+
   # Настройки маскирования для конкретных типов
   masking_rules:
     PERSON:
@@ -107,8 +116,15 @@ default: &default
 
 # Конфигурация для конкретных систем-потребителей
 systems:
+  "checker":
+    <<: *default
+    enabled: true
+    demask_enabled: true
+
   "crm-system":
     <<: *default
+    enabled: true
+    demask_enabled: true
     enabled_entity_types:
       - "PERSON"
       - "PHONE"
@@ -121,6 +137,8 @@ systems:
 
   "loan-scoring":
     <<: *default
+    enabled: true
+    demask_enabled: true
     enabled_entity_types:
       - "PERSON"
       - "PASSPORT_SERIES"
@@ -139,6 +157,8 @@ systems:
 
   "support-chat":
     <<: *default
+    enabled: true
+    demask_enabled: true
     enabled_entity_types:
       - "PERSON"
       - "PHONE"
@@ -160,3 +180,12 @@ systems:
         token_format: "PERSON_{index}"
       ADDRESS:
         token_format: "ADDR_{index}"
+
+  "demo-no-unmask":
+    <<: *default
+    enabled: true
+    demask_enabled: false
+
+  "disabled-system":
+    <<: *default
+    enabled: false
