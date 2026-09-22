@@ -59,6 +59,10 @@ class PIISanitizingFilter(logging.Filter):
                 if isinstance(value, str):
                     setattr(record, key, self._sanitize(value))
 
+        # Никогда не логируем raw payload_id
+        if hasattr(record, "payload_id"):
+            record.payload_id = "[REDACTED_PAYLOAD_ID]"
+
         return True
 
     def _sanitize(self, text: str) -> str:

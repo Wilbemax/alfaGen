@@ -61,7 +61,7 @@ def _match(entity_type: str, text: str, start: int, end: int) -> PIIMatch:
 @pytest.mark.asyncio
 async def test_cascade_calls_natasha_with_occupied() -> None:
     email = _match("EMAIL", "ivan@example.com", 0, 16)
-    person = _match("PERSON", "Иванов Иван", 20, 31)
+    person = _match("PERSON", "Иванов Иван", 17, 28)
     regex = FakeRegexDetector([email])
     natasha = FakeNatashaDetector([person])
     cascade = CascadeDetector(regex_detector=regex, natasha_detector=natasha)
@@ -90,7 +90,7 @@ async def test_cascade_survives_natasha_exception() -> None:
 @pytest.mark.asyncio
 async def test_allowed_types_filters_results() -> None:
     email = _match("EMAIL", "ivan@example.com", 0, 16)
-    person = _match("PERSON", "Иванов Иван", 20, 31)
+    person = _match("PERSON", "Иванов Иван", 17, 28)
     regex = FakeRegexDetector([email])
     natasha = FakeNatashaDetector([person])
     cascade = CascadeDetector(regex_detector=regex, natasha_detector=natasha)
