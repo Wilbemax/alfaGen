@@ -55,9 +55,13 @@ async def test_detect_passport_dept_code(regex_detector):
 
 @pytest.mark.asyncio
 async def test_detect_date_of_birth(regex_detector):
-    matches = await regex_detector.detect("Дата рождения: 12.05.1990")
-    assert len(matches) >= 1
-    assert any(m.entity_type == "DATE_OF_BIRTH" for m in matches)
+    source = "Дата рождения: 12.05.1990"
+    matches = await regex_detector.detect(source)
+    date = next(m for m in matches if m.entity_type == "DATE_OF_BIRTH")
+    assert date.text == "12.05.1990"
+    assert date.start == source.index(date.text)
+    assert date.end == date.start + len(date.text)
+    assert date.text == source[date.start:date.end]
 
 
 @pytest.mark.asyncio
@@ -175,6 +179,11 @@ async def test_citizenship_not_person(regex_detector):
     [
         ("Гражданство: РФ", "РФ"),
         ("гражданство Российской Федерации", "Российской Федерации"),
+        ("Гражданство: Казахстан", "Казахстан"),
+        ("гражданство Украины", "Украины"),
+        ("Гражданство Республики Беларусь", "Республики Беларусь"),
+        ("гражданка Республики Беларусь", "Республики Беларусь"),
+        ("ГРАЖДАНСТВО: БЕЛАРУСЬ", "БЕЛАРУСЬ"),
     ],
 )
 async def test_detect_citizenship_value_only(regex_detector, source, expected):
@@ -190,8 +199,16 @@ async def test_detect_citizenship_value_only(regex_detector, source, expected):
 
 
 @pytest.mark.asyncio
-async def test_citizenship_requires_explicit_context(regex_detector):
-    source = "Договор действует на территории РФ"
+@pytest.mark.parametrize(
+    "source",
+    [
+        "Договор действует на территории РФ",
+        "РФ подписала соглашение",
+        "Казахстан находится в Центральной Азии",
+        "Российская Федерация занимает большую территорию",
+    ],
+)
+async def test_citizenship_requires_explicit_context(regex_detector, source):
     matches = await regex_detector.detect(source)
 
     assert not any(m.entity_type == "CITIZENSHIP" for m in matches)
@@ -208,18 +225,33 @@ async def test_citizen_keyword_is_supported(regex_detector):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("marker", ["Держатель карты:", "cardholder", "holder"])
-async def test_detect_card_holder_value_only(regex_detector, marker):
-    source = f"{marker} IVAN IVANOV"
+async def test_citizen_context_does_not_accept_arbitrary_person(regex_detector):
+    source = "Гражданин Иванов подал заявление"
+    matches = await regex_detector.detect(source)
+
+    assert not any(m.entity_type == "CITIZENSHIP" for m in matches)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("source", "expected"),
+    [
+        ("Держатель карты: IVAN IVANOV", "IVAN IVANOV"),
+        ("Держатель карты: Ivan Ivanov", "Ivan Ivanov"),
+        ("cardholder: JOHN SMITH", "JOHN SMITH"),
+        ("holder Ivan Ivanov", "Ivan Ivanov"),
+    ],
+)
+async def test_detect_card_holder_value_only(regex_detector, source, expected):
     matches = await regex_detector.detect(source)
     holders = [m for m in matches if m.entity_type == "CARD_HOLDER"]
 
     assert len(holders) == 1
     match = holders[0]
-    assert match.text == "IVAN IVANOV"
+    assert match.text == expected
     assert source[match.start:match.end] == match.text
-    assert match.start == source.index("IVAN IVANOV")
-    assert match.end == match.start + len("IVAN IVANOV")
+    assert match.start == source.index(expected)
+    assert match.end == match.start + len(expected)
 
 
 @pytest.mark.asyncio
@@ -228,6 +260,10 @@ async def test_detect_card_holder_value_only(regex_detector, marker):
     [
         "NEW YORK is a city",
         "ALPHA BETA указаны в отчёте",
+        "JOHN SMITH arrived yesterday",
+        "IVAN IVANOV",
+        "Microsoft Corporation",
+        "holder Ivan Ivanov arrived",
     ],
 )
 async def test_uppercase_pair_without_holder_context_is_not_detected(
@@ -347,7 +383,29 @@ async def test_passport_beats_driver_license_and_inn(regex_detector):
 )
 async def test_date_forms_and_context(regex_detector, text, expected_type):
     matches = await regex_detector.detect(text)
-    assert any(m.entity_type == expected_type for m in matches)
+    date = next(m for m in matches if m.entity_type == expected_type)
+    assert date.text == text[date.start:date.end]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "source",
+    [
+        "Встреча назначена на 12.05.2026",
+        "Договор подписан 01.02.2025",
+        "Срок действия до 31.12.2027",
+        "Отчёт сформирован 15.01.2026",
+    ],
+)
+async def test_calendar_date_without_personal_context_is_not_detected(
+    regex_detector,
+    source,
+):
+    matches = await regex_detector.detect(source)
+    assert not any(
+        match.entity_type in {"DATE_OF_BIRTH", "PASSPORT_ISSUE_DATE"}
+        for match in matches
+    )
 
 
 @pytest.mark.asyncio

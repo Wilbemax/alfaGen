@@ -40,11 +40,17 @@ class RegexDetector(BaseDetector):
         r"(?<!\d)(?:\d{2}\s\d{2}\s\d{6}|\d{4}\s\d{6}|\d{2}\s\d{6})(?!\d)"
     )
     _CITIZENSHIP_VALUE = re.compile(
-        r"(?iu)(?<![а-яёa-z])(?:рф|российск(?:ая|ой|ую)\s+"
-        r"федерац(?:ия|ии|ию))(?![а-яёa-z])"
+        r"(?iu)(?<![а-яёa-z])(?:гражданство|гражданин|гражданка)"
+        r"(?![а-яёa-z])[ \t]*(?:[:—-][ \t]*)?"
+        r"(?P<value>рф|российск(?:ая|ой|ую)\s+федерац(?:ия|ии|ию)"
+        r"|росси(?:я|и|ю)|казахстан(?:а)?|украин(?:а|ы|е|у)"
+        r"|(?:республик(?:а|и|у)[ \t]+)?беларус(?:ь|и))"
+        r"(?![а-яёa-z])"
     )
     _CARD_HOLDER_VALUE = re.compile(
-        r"(?<![A-Za-z])[A-Z]+[ \t]+[A-Z]+(?![A-Za-z])"
+        r"(?iu)(?<![а-яёa-z])(?:держатель(?:[ \t]+карты)?|cardholder|holder)"
+        r"(?![а-яёa-z])[ \t]*(?:[:—-][ \t]*)?"
+        r"(?P<value>[a-z]+[ \t]+[a-z]+)(?![a-z]|[ \t]+[a-z])"
     )
 
     _TYPE_SPECIFICITY: ClassVar[dict[str, int]] = {
@@ -233,11 +239,16 @@ class RegexDetector(BaseDetector):
                     r"(?:выдано?|дата\s+выдачи)\W*$",
                     before,
                 )
-                entity_type = (
-                    "PASSPORT_ISSUE_DATE"
-                    if issue_context
-                    else "DATE_OF_BIRTH"
+                birth_context = re.search(
+                    r"(?:дата\s+рождения|родил(?:ся|ась))\W*$",
+                    before,
                 )
+                if issue_context:
+                    entity_type = "PASSPORT_ISSUE_DATE"
+                elif birth_context:
+                    entity_type = "DATE_OF_BIRTH"
+                else:
+                    continue
                 found.append(
                     self._make_match(entity_type, text, start, end, 0.92)
                 )
@@ -249,7 +260,7 @@ class RegexDetector(BaseDetector):
             (
                 "CITIZENSHIP",
                 self._CITIZENSHIP_VALUE,
-                ("гражданство", "гражданин"),
+                ("гражданство", "гражданин", "гражданка"),
                 0.95,
             ),
             (
@@ -261,7 +272,11 @@ class RegexDetector(BaseDetector):
         )
         for entity_type, pattern, keywords, confidence in contextual_patterns:
             for match in pattern.finditer(text):
-                start, end = match.span()
+                start, end = (
+                    match.span("value")
+                    if "value" in match.groupdict()
+                    else match.span()
+                )
                 if self._has_context(text, start, end, keywords):
                     found.append(
                         self._make_match(entity_type, text, start, end, confidence)

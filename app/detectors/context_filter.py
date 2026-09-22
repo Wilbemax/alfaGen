@@ -40,47 +40,61 @@ class ContextFilter:
     def __init__(self, rules: PIIRulesConfig | None = None) -> None:
         self.rules = rules if rules is not None else pii_rules
 
-    def filter(self, text: str, matches: list["PIIMatch"]) -> list["PIIMatch"]:
+    def filter(self, text: str, matches: list[PIIMatch]) -> list[PIIMatch]:
         if not text or not matches:
             return []
-        resolved = self._resolve_overlaps(matches)
+        normalized = [
+            m
+            for m in matches
+            if m.start >= 0
+            and m.end <= len(text)
+            and m.start < m.end
+            and text[m.start:m.end] == m.text
+        ]
+        resolved = self._resolve_overlaps(normalized)
         resolved = [m for m in resolved if m.confidence >= CONFIDENCE_THRESHOLD]
         filtered = self._apply_exclusions(text, resolved)
         filtered.sort(key=lambda m: m.start)
         return filtered
 
-    def _resolve_overlaps(self, matches: list["PIIMatch"]) -> list["PIIMatch"]:
+    def _resolve_overlaps(self, matches: list[PIIMatch]) -> list[PIIMatch]:
         """Более специфичный и более длинный спан побеждает."""
-        kept: list["PIIMatch"] = []
-        for m in sorted(matches, key=lambda x: (x.start, -self._specificity(x), -(x.end - x.start))):
+        kept: list[PIIMatch] = []
+        ordered = sorted(
+            matches,
+            key=lambda x: (
+                self._specificity(x),
+                x.end - x.start,
+                x.confidence,
+                -x.start,
+            ),
+            reverse=True,
+        )
+        for m in ordered:
             if self._is_overlapped(m, kept):
                 continue
             kept.append(m)
         return kept
 
-    def _is_overlapped(self, m: "PIIMatch", kept: list["PIIMatch"]) -> bool:
+    def _is_overlapped(self, m: PIIMatch, kept: list[PIIMatch]) -> bool:
         for other in kept:
             if m.start >= other.end or other.start >= m.end:
-                continue
-            if self._specificity(m) > self._specificity(other):
-                continue
-            if self._specificity(m) == self._specificity(other) and m.end - m.start > other.end - other.start:
                 continue
             return True
         return False
 
     @staticmethod
-    def _specificity(m: "PIIMatch") -> int:
+    def _specificity(m: PIIMatch) -> int:
         return _TYPE_SPECIFICITY.get(m.entity_type, 0)
 
-    def _apply_exclusions(self, text: str, matches: list["PIIMatch"]) -> list["PIIMatch"]:
+    def _apply_exclusions(self, text: str, matches: list[PIIMatch]) -> list[PIIMatch]:
         exclusions = self.rules.default.get("exclusions", {})
         historical = {s.lower() for s in exclusions.get("historical_persons", [])}
         service_words = {s.lower() for s in exclusions.get("service_words", [])}
         bank_branches = {s.lower() for s in exclusions.get("bank_branches", [])}
         bank_patterns = exclusions.get("bank_address_patterns", [])
 
-        result: list["PIIMatch"] = []
+        result: list[PIIMatch] = []
         for m in matches:
             if m.entity_type == "PERSON":
                 person_result = self._person_excluded(text, m, historical, service_words)
@@ -100,7 +114,7 @@ class ContextFilter:
     def _person_excluded(
         self,
         text: str,
-        m: "PIIMatch",
+        m: PIIMatch,
         historical: set[str],
         service_words: set[str],
     ) -> bool | PIIMatch:
@@ -130,9 +144,13 @@ class ContextFilter:
 
         # Служебные слова в начале/конце обрезаем: создаём новый спан.
         if start_idx > 0 or end_idx < len(words):
-            new_start = m.start + len(" ".join(words[:start_idx])) + (1 if start_idx > 0 else 0)
-            new_end = m.end - len(" ".join(words[end_idx:])) - (1 if end_idx < len(words) else 0)
-            new_text = " ".join(remaining)
+            pattern = r"\s+".join(re.escape(w) for w in remaining)
+            match = re.search(pattern, m.text)
+            if match is None:
+                return True
+            new_start = m.start + match.start()
+            new_end = m.start + match.end()
+            new_text = m.text[match.start():match.end()]
             if len(new_text.split()) < 2:
                 return True
             m = PIIMatch(
@@ -150,7 +168,7 @@ class ContextFilter:
     def _address_excluded(
         self,
         text: str,
-        m: "PIIMatch",
+        m: PIIMatch,
         bank_branches: set[str],
         bank_patterns: list[str],
     ) -> bool:
@@ -165,6 +183,6 @@ class ContextFilter:
                 logger.warning("Invalid bank_address_pattern ignored")
         return False
 
-    def _card_holder_kept(self, text: str, m: "PIIMatch") -> bool:
+    def _card_holder_kept(self, text: str, m: PIIMatch) -> bool:
         window = text[max(0, m.start - 40): min(len(text), m.end + 40)].lower()
         return any(k in window for k in ("держатель", "cardholder", "holder"))

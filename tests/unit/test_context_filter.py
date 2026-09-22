@@ -86,12 +86,12 @@ def test_low_confidence_match_removed(context_filter: ContextFilter) -> None:
 
 def test_service_word_trimmed_from_person(context_filter: ContextFilter) -> None:
     text = "клиент Иванов Иван"
-    person = _match("PERSON", "клиент Иванов Иван", 0, 17)
+    person = _match("PERSON", "клиент Иванов Иван", 0, 18)
     result = context_filter.filter(text, [person])
     assert len(result) == 1
     assert result[0].text == "Иванов Иван"
     assert result[0].start == 7
-    assert result[0].end == 17
+    assert result[0].end == 18
 
 
 def test_service_word_only_person_removed(context_filter: ContextFilter) -> None:
@@ -99,3 +99,46 @@ def test_service_word_only_person_removed(context_filter: ContextFilter) -> None
     person = _match("PERSON", "клиент", 0, 6)
     result = context_filter.filter(text, [person])
     assert result == []
+
+
+def test_overlap_passport_wins_over_address(context_filter: ContextFilter) -> None:
+    """ADDRESS [0,10) и PASSPORT [6,16): специфичность PASSPORT выше -> только PASSPORT."""
+    text = "адрес паспортные данные"
+    address = _match("ADDRESS", "адрес пасп", 0, 10)
+    passport = _match("PASSPORT", "паспортные", 6, 16)
+    result = context_filter.filter(text, [address, passport])
+    assert [m.entity_type for m in result] == ["PASSPORT"]
+
+
+def test_touching_spans_not_overlap(context_filter: ContextFilter) -> None:
+    """Касающиеся границы [0,6) и [6,12) не считаются пересечением."""
+    text = "a@b.ruc@d.ru"
+    first = _match("EMAIL", "a@b.ru", 0, 6)
+    second = _match("EMAIL", "c@d.ru", 6, 12)
+    result = context_filter.filter(text, [first, second])
+    assert [m.entity_type for m in result] == ["EMAIL", "EMAIL"]
+
+
+def test_trimming_with_tab_uses_real_offsets(context_filter: ContextFilter) -> None:
+    """'клиент\\tИванов Иван' -> start указывает на 'И', без пробелов."""
+    text = "клиент\tИванов Иван"
+    person = _match("PERSON", "клиент\tИванов Иван", 0, 18)
+    result = context_filter.filter(text, [person])
+    assert len(result) == 1
+    assert result[0].text == "Иванов Иван"
+    assert result[0].start == 7
+    assert result[0].end == 18
+    # Инвариант: new_text == text[new_start:new_end]
+    assert result[0].text == text[result[0].start:result[0].end]
+
+
+def test_trimming_with_multiple_spaces(context_filter: ContextFilter) -> None:
+    """Множественные пробелы между словами учитываются при обрезке."""
+    text = "клиент   Иванов Иван"
+    person = _match("PERSON", "клиент   Иванов Иван", 0, 20)
+    result = context_filter.filter(text, [person])
+    assert len(result) == 1
+    assert result[0].text == "Иванов Иван"
+    assert result[0].start == 9
+    assert result[0].end == 20
+    assert result[0].text == text[result[0].start:result[0].end]

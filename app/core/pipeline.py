@@ -1,11 +1,12 @@
 from __future__ import annotations
 
+import hashlib
 import logging
 import time
 from collections import Counter
 from typing import Any
 
-from app.config.settings import pii_rules
+from app.config.settings import pii_rules, settings
 from app.core.masker import MaskResult, masker
 from app.core.payload_store import PayloadRecord, payload_store
 from app.detectors.cascade import CascadeDetector
@@ -100,7 +101,7 @@ class Pipeline:
         logger.info(
             event,
             extra={
-                "payload_id": payload_id,
+                "payload_id": hashlib.sha256(payload_id.encode("utf-8")).hexdigest()[:8],
                 "duration_ms": round((time.monotonic() - start_time) * 1000, 2),
                 "entity_count": len(entity_types),
                 "entity_types": dict(counts),
@@ -117,6 +118,9 @@ class Pipeline:
             entities = await self.cascade.detect(payload, allowed_types=allowed_types)
         except Exception:
             raise PipelineError("detection failed") from None
+
+        if len(entities) > settings.pipeline_max_entities_per_request:
+            raise PipelineError("entity_limit_exceeded")
 
         mask_result = masker.mask(payload, entities)
 
