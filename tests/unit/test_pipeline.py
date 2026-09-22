@@ -2,8 +2,9 @@ from __future__ import annotations
 
 import pytest
 
+from app.config.settings import settings
 from app.core.payload_store import payload_store
-from app.core.pipeline import Pipeline
+from app.core.pipeline import Pipeline, PipelineError
 
 
 @pytest.fixture
@@ -118,3 +119,34 @@ async def test_unmask_allowed_without_system_id(pipeline, sample_text):
     masked = await pipeline.process(sample_text, payload_id)
     restored = await pipeline.process(masked, payload_id)
     assert restored == sample_text
+
+
+@pytest.mark.asyncio
+async def test_entity_limit_exceeded_raises(pipeline, monkeypatch):
+    """Превышение pipeline_max_entities_per_request -> PipelineError."""
+    monkeypatch.setattr(settings, "pipeline_max_entities_per_request", 1)
+
+    class FakeCascade:
+        async def detect(self, payload, allowed_types=None):
+            from app.models.pii import PIIMatch
+            return [
+                PIIMatch("PERSON", "Иван", 0, 4, 0.9, "test"),
+                PIIMatch("EMAIL", "a@b.ru", 5, 11, 0.9, "test"),
+            ]
+
+    pipeline.cascade = FakeCascade()
+    with pytest.raises(PipelineError) as exc_info:
+        await pipeline.process("Иван a@b.ru", "unit-limit-1")
+    assert "entity_limit_exceeded" in str(exc_info.value)
+
+
+@pytest.mark.asyncio
+async def test_payload_id_email_not_in_logs(pipeline, sample_text, caplog):
+    """Raw payload_id (email) не попадает в логи."""
+    import logging
+
+    payload_id = "ivan@example.com"
+    with caplog.at_level(logging.INFO):
+        await pipeline.process(sample_text, payload_id)
+
+    assert "ivan@example.com" not in caplog.text

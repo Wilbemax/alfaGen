@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import threading
@@ -67,6 +68,18 @@ class PayloadStore:
 
     async def initialize(self) -> None:
         """Инициализация Redis подключения (с fallback на in-memory)."""
+        # Multi-worker без Redis/Fernet запрещён: in-memory fallback не разделяется
+        # между воркерами и ломает идемпотентность/демаскирование.
+        if settings.uvicorn_workers > 1 and (self._redis is None or self._fernet is None):
+            logger.critical(
+                "Multi-worker mode requires Redis and PAYLOAD_STORE_KEY; "
+                "in-memory fallback is only allowed for a single worker"
+            )
+            raise RuntimeError(
+                "Multi-worker mode requires Redis and PAYLOAD_STORE_KEY; "
+                "in-memory fallback is only allowed for a single worker"
+            )
+
         # Ключ шифрования берём только из settings.payload_store_key.
         key = settings.payload_store_key
         if not key:
@@ -108,16 +121,21 @@ class PayloadStore:
             self.redis_available = False
 
     async def put(self, payload_id: str, record: PayloadRecord) -> None:
-        """Сохраняет запись соответствия по payload_id."""
+        """Сохраняет запись соответствия по payload_id (put-if-absent, идемпотентно)."""
+        key = self._key(payload_id)
         if self._redis is not None and self._fernet is not None:
             try:
                 plaintext = json.dumps(record.to_dict(), ensure_ascii=False).encode("utf-8")
                 ciphertext = self._fernet.encrypt(plaintext)
-                await self._redis.set(
-                    self._key_prefix + payload_id,
+                inserted = await self._redis.set(
+                    key,
                     ciphertext,
                     ex=int(self._ttl),
+                    nx=True,
                 )
+                if inserted is False:
+                    # Ключ уже существует — не перезаписываем (идемпотентность).
+                    return
             except Exception as e:
                 logger.warning(f"Redis payload store put failed, falling back to memory: {e}")
             else:
@@ -126,20 +144,29 @@ class PayloadStore:
 
     async def get(self, payload_id: str) -> PayloadRecord | None:
         """Возвращает запись соответствия или None, если её нет/протухла."""
+        key = self._key(payload_id)
         if self._redis is not None and self._fernet is not None:
             try:
-                raw = await self._redis.get(self._key_prefix + payload_id)
+                raw = await self._redis.get(key)
                 if raw is not None:
                     plaintext = self._fernet.decrypt(raw)
                     return PayloadRecord.from_dict(json.loads(plaintext.decode("utf-8")))
             except InvalidToken:
                 logger.warning("Payload store record failed to decrypt, falling back to memory")
             except Exception as e:
-                logger.warning(f"Redis payload store get failed, falling back to memory: {e}")
+                logger.warning(f"Payload store get failed, falling back to memory: {e}")
         return self._get_local(payload_id)
+
+    def _key(self, payload_id: str) -> str:
+        """Хешированный ключ хранилища. Raw payload_id никогда не используется в ключе."""
+        digest = hashlib.sha256(payload_id.encode("utf-8")).hexdigest()
+        return f"{self._key_prefix}{digest}"
 
     def _put_local(self, payload_id: str, record: PayloadRecord) -> None:
         with self._lock:
+            # Идемпотентность: если ключ уже есть — не перезаписываем.
+            if payload_id in self._records:
+                return
             # Амортизированная очистка: полный проход по записям делаем не чаще,
             # чем раз в _evict_interval вставок. Корректность TTL обеспечивает
             # ленивая проверка в _get_local.
