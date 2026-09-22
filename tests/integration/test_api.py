@@ -55,6 +55,18 @@ MASK_CASES = [
         id="date_of_birth_slash",
     ),
     pytest.param(
+        "Гражданство: РФ",
+        "Гражданство: **",
+        False,
+        id="citizenship",
+    ),
+    pytest.param(
+        "Держатель карты: IVAN IVANOV",
+        "Держатель карты: ***********",
+        False,
+        id="card_holder",
+    ),
+    pytest.param(
         "родился 12 мая 1990 года в городе Казань",
         "родился **************** в *************",
         True,

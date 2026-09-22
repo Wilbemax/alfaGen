@@ -5,6 +5,7 @@ import os
 import re
 import time
 from collections.abc import Callable
+from functools import lru_cache
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -29,17 +30,13 @@ _BIRTH_CUES = ("место рождения", "родился", "родилас�
 _ISSUER_CUES = ("выдан", "выдано", "уфмс", "оуфмс", "мвд", "овд")
 _SERVICE_PREFIX = re.compile(r"(?iu)(?:поэт|клиент|уважаемый)\s+")
 _ISSUER_PREFIX = re.compile(r"(?iu)(?:выдан|выдано)\s+")
-_PLACE_LEFT = re.compile(r"(?iu)(?:городе|город|г\.)\s+$")
-_ADDRESS_PART = (
-    r"(?:росси[яи]|рф|\d{6}"
-    r"|(?:г\.?|город)\s+[а-яё\-]+"
-    r"|(?:ул\.?|улица|проспект|пер\.?|переулок|шоссе)\s+[а-яё\-]+"
-    r"|(?:д\.?|дом)\s*\d+[а-яё]?"
-    r"|(?:кв\.?|квартира)\s*\d+"
-    r"|(?:корп\.?|корпус)\s*\d+)"
+_PLACE_LEFT = re.compile(
+    r"(?iu)(?:городе|город|г\.|улица|ул\.?|проспект)\s+$"
 )
-_ADDRESS_CLAUSE = re.compile(
-    rf"(?iu){_ADDRESS_PART}(?:\s*,\s*{_ADDRESS_PART})+",
+_ADDRESS_SERVICE_PREFIX = re.compile(r"(?iu)\bпроживает\b[ \t]*:[ \t]*")
+_STRUCTURED_ADDRESS_COMPONENT = re.compile(
+    r"(?iu)^(?:\d{6}|(?:г\.?|город|ул\.?|улица|проспект|д\.?|дом|кв\.?|индекс)"
+    r"(?:\s|$))"
 )
 
 
@@ -87,7 +84,6 @@ class NatashaDetector(BaseDetector):
             logger.warning("Natasha model load failed, detector disabled")
             self.config.enabled = False
             self._ner_runner = None
-            raise
 
     async def detect(
         self,
@@ -111,34 +107,45 @@ class NatashaDetector(BaseDetector):
             return []
 
         covered = _merge_spans(occupied or [], len(text))
-        matches: list[PIIMatch] = []
-        for offset, chunk in _gaps(text, covered):
-            if deadline_monotonic is not None and time.monotonic() >= deadline_monotonic:
-                break
-            if not chunk or not self._has_signal(chunk):
-                continue
-            for start, end, tag, score in self._ner_runner(chunk):
-                absolute_start = offset + start
-                absolute_end = offset + end
-                if _overlaps(absolute_start, absolute_end, covered):
-                    continue
-                mapped = self._map_span(text, absolute_start, absolute_end, tag, score)
-                if mapped is None or _overlaps(mapped.start, mapped.end, covered):
-                    continue
-                matches.append(mapped)
+        prepared = _mask_occupied(text, covered)
+        if not self._has_signal(prepared):
+            return []
 
-        matches = _with_address_clauses(text, matches, covered)
-        matches.sort(key=lambda item: (item.start, item.end))
-        return matches
+        matches: list[PIIMatch] = []
+        if deadline_monotonic is not None and time.monotonic() >= deadline_monotonic:
+            return []
+        try:
+            raw_spans = self._ner_runner(prepared)
+        except Exception:
+            logger.warning("Natasha NER failed, entities omitted")
+            return []
+
+        for raw_span in raw_spans:
+            if not isinstance(raw_span, (tuple, list)) or len(raw_span) != 4:
+                continue
+            start, end, tag, score = raw_span
+            if not isinstance(start, int) or not isinstance(end, int):
+                continue
+            if _overlaps(start, end, covered):
+                continue
+            mapped = self._map_span(text, start, end, str(tag), score)
+            if mapped is None or _overlaps(mapped.start, mapped.end, covered):
+                continue
+            matches.append(mapped)
+
+        if deadline_monotonic is not None and time.monotonic() >= deadline_monotonic:
+            return []
+        expanded = _expand_address_matches(text, matches, covered, self.name)
+        deduplicated = {
+            (match.entity_type, match.start, match.end): match for match in expanded
+        }
+        return sorted(deduplicated.values(), key=lambda item: (item.start, item.end))
 
     def _load_models(self) -> None:
-        from natasha import Doc, Segmenter
-
-        segmenter = Segmenter()
-        tagger = _build_tagger()
+        doc_cls, segmenter, tagger = _load_natasha_models()
         self._segmenter = segmenter
         self._tagger = tagger
-        self._doc_cls = Doc
+        self._doc_cls = doc_cls
         self._ner_runner = self._run_natasha
 
     def _run_natasha(self, text: str) -> list[tuple[int, int, str, float]]:
@@ -223,37 +230,12 @@ def _build_tagger() -> object:
     return NewsNERTagger(NewsEmbedding())
 
 
-def _with_address_clauses(
-    text: str,
-    matches: list[PIIMatch],
-    covered: list[tuple[int, int]],
-) -> list[PIIMatch]:
-    """Склеивает соседние части адреса в один спан."""
-    clauses: list[PIIMatch] = []
-    for match in _ADDRESS_CLAUSE.finditer(text):
-        start, end = match.span()
-        if _overlaps(start, end, covered):
-            continue
-        snippet = text[start:end]
-        clauses.append(
-            PIIMatch(
-                entity_type="ADDRESS",
-                text=snippet,
-                start=start,
-                end=end,
-                confidence=0.9,
-                detector_name="natasha",
-            )
-        )
-    if not clauses:
-        return matches
-    kept = [
-        item
-        for item in matches
-        if item.entity_type not in {"ADDRESS", "ADDRESS_PARTIAL"}
-        or not any(item.start < clause.end and item.end > clause.start for clause in clauses)
-    ]
-    return kept + clauses
+@lru_cache(maxsize=1)
+def _load_natasha_models() -> tuple[type[Doc], Segmenter, object]:
+    """Создаёт и сохраняет общий комплект моделей Natasha для процесса."""
+    from natasha import Doc, Segmenter
+
+    return Doc, Segmenter(), _build_tagger()
 
 
 def _window(text: str, start: int, end: int) -> str:
@@ -273,6 +255,119 @@ def _expand_place_left(text: str, start: int) -> int:
     if matched is None:
         return start
     return start - len(matched.group())
+
+
+def _expand_address_matches(
+    text: str,
+    matches: list[PIIMatch],
+    covered: list[tuple[int, int]],
+    detector_name: str,
+) -> list[PIIMatch]:
+    expanded: list[PIIMatch] = []
+    for match in matches:
+        if match.entity_type != "ADDRESS":
+            expanded.append(match)
+            continue
+        start, end = _structured_address_bounds(text, match.start, match.end)
+        for safe_start, safe_end in _subtract_occupied(start, end, covered):
+            expanded.append(
+                PIIMatch(
+                    entity_type="ADDRESS",
+                    text=text[safe_start:safe_end],
+                    start=safe_start,
+                    end=safe_end,
+                    confidence=match.confidence,
+                    detector_name=detector_name,
+                )
+            )
+    return expanded
+
+
+def _structured_address_bounds(
+    text: str,
+    address_start: int,
+    address_end: int,
+) -> tuple[int, int]:
+    section_start = max(
+        text.rfind(";", 0, address_start),
+        text.rfind("\n", 0, address_start),
+        text.rfind("\r", 0, address_start),
+    ) + 1
+    section_end = len(text)
+    for separator in (";", "\n", "\r"):
+        position = text.find(separator, address_end)
+        if position != -1:
+            section_end = min(section_end, position)
+
+    components: list[tuple[int, int, str]] = []
+    for component in re.finditer(r"[^,]+", text[section_start:section_end]):
+        start = section_start + component.start()
+        end = section_start + component.end()
+        while start < end and text[start].isspace():
+            start += 1
+        while end > start and text[end - 1].isspace():
+            end -= 1
+        if start < end:
+            components.append((start, end, text[start:end]))
+
+    anchor = next(
+        (
+            index
+            for index, (start, end, _) in enumerate(components)
+            if address_start < end and address_end > start
+        ),
+        None,
+    )
+    if anchor is None:
+        return address_start, address_end
+    if not _is_address_component(components[anchor]):
+        return address_start, address_end
+
+    left = anchor
+    while left > 0 and _is_address_component(components[left - 1]):
+        left -= 1
+    right = anchor
+    while right + 1 < len(components) and _is_address_component(components[right + 1]):
+        right += 1
+
+    start, _, first_text = components[left]
+    prefix = _ADDRESS_SERVICE_PREFIX.search(first_text)
+    if prefix is not None:
+        start += prefix.end()
+    end = components[right][1]
+    if start >= end:
+        return address_start, address_end
+    return start, end
+
+
+def _is_address_component(component: tuple[int, int, str]) -> bool:
+    _, _, value = component
+    return (
+        _ADDRESS_SERVICE_PREFIX.search(value) is not None
+        or _STRUCTURED_ADDRESS_COMPONENT.search(value) is not None
+    )
+
+
+def _subtract_occupied(
+    start: int,
+    end: int,
+    covered: list[tuple[int, int]],
+) -> list[tuple[int, int]]:
+    safe: list[tuple[int, int]] = []
+    cursor = start
+    for occupied_start, occupied_end in covered:
+        if occupied_end <= cursor:
+            continue
+        if occupied_start >= end:
+            break
+        if cursor < occupied_start:
+            safe.append((cursor, min(occupied_start, end)))
+        cursor = max(cursor, occupied_end)
+        if cursor >= end:
+            break
+    if cursor < end:
+        safe.append((cursor, end))
+    return [(part_start, part_end) for part_start, part_end in safe if part_start < part_end]
 
 
 def _extend_issuer(text: str, start: int, end: int) -> int:
@@ -308,12 +403,20 @@ def _consume_prefix(text: str, start: int, end: int, pattern: re.Pattern[str]) -
 
 
 def _merge_spans(spans: list[tuple[int, int]], length: int) -> list[tuple[int, int]]:
-    merged: list[tuple[int, int]] = []
-    for start, end in sorted(spans):
-        start = max(0, start)
-        end = min(length, end)
-        if start >= end:
+    normalized: list[tuple[int, int]] = []
+    for interval in spans:
+        if not isinstance(interval, (tuple, list)) or len(interval) != 2:
             continue
+        start, end = interval
+        if not isinstance(start, int) or not isinstance(end, int):
+            continue
+        start = max(0, min(length, start))
+        end = max(0, min(length, end))
+        if start < end:
+            normalized.append((start, end))
+
+    merged: list[tuple[int, int]] = []
+    for start, end in sorted(normalized):
         if merged and start <= merged[-1][1]:
             merged[-1] = (merged[-1][0], max(merged[-1][1], end))
         else:
@@ -321,16 +424,11 @@ def _merge_spans(spans: list[tuple[int, int]], length: int) -> list[tuple[int, i
     return merged
 
 
-def _gaps(text: str, covered: list[tuple[int, int]]) -> list[tuple[int, str]]:
-    chunks: list[tuple[int, str]] = []
-    cursor = 0
+def _mask_occupied(text: str, covered: list[tuple[int, int]]) -> str:
+    characters = list(text)
     for start, end in covered:
-        if cursor < start:
-            chunks.append((cursor, text[cursor:start]))
-        cursor = max(cursor, end)
-    if cursor < len(text):
-        chunks.append((cursor, text[cursor:]))
-    return chunks
+        characters[start:end] = " " * (end - start)
+    return "".join(characters)
 
 
 def _overlaps(start: int, end: int, covered: list[tuple[int, int]]) -> bool:
