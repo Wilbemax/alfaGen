@@ -5,13 +5,35 @@ import json
 import logging
 import threading
 import time
+from contextlib import suppress
 from dataclasses import dataclass, field
+from typing import Any, NoReturn
 
-from cryptography.fernet import Fernet, InvalidToken
+from cryptography.fernet import Fernet
 
 from app.config.settings import settings
 
 logger = logging.getLogger(__name__)
+
+MODE_REDIS = "redis"
+MODE_MEMORY = "memory"
+DEFAULT_SCOPE = "checker"
+
+
+class PayloadStoreError(Exception):
+    """Контролируемая ошибка хранилища.
+
+    Текст исключения не содержит ключ шифрования, исходник, маску
+    и аргументы Redis-команды.
+    """
+
+
+def normalize_scope(system_id: str | None) -> str:
+    """Стабильный system scope. Пустой и отсутствующий id → ``checker``."""
+    if system_id is None:
+        return DEFAULT_SCOPE
+    scope = system_id.strip()
+    return scope or DEFAULT_SCOPE
 
 
 @dataclass(slots=True)
@@ -22,7 +44,7 @@ class PayloadRecord:
     entity_types: list[str] = field(default_factory=list)
     created_at: float = field(default_factory=time.monotonic)
 
-    def to_dict(self) -> dict:
+    def to_dict(self) -> dict[str, Any]:
         return {
             "original": self.original_text,
             "mask": self.masked_text,
@@ -30,7 +52,7 @@ class PayloadRecord:
         }
 
     @classmethod
-    def from_dict(cls, data: dict) -> PayloadRecord:
+    def from_dict(cls, data: dict[str, Any]) -> PayloadRecord:
         return cls(
             original_text=data["original"],
             masked_text=data["mask"],
@@ -40,13 +62,16 @@ class PayloadRecord:
 
 class PayloadStore:
     """
-    Хранилище соответствий по payload_id.
+    Хранилище соответствий по system scope и payload_id.
 
-    Приоритет — Redis (shared state между воркерами), при недоступности —
-    in-memory fallback в процессе. Записи протухают по TTL.
+    Режим выбирается один раз в ``initialize`` и дальше не меняется:
 
-    В значении хранятся исходник, маска и типы сущностей. Эти строки
-    никогда не попадают в логи.
+    * ``redis`` — Fernet-шифротекст в Redis (SET NX EX);
+    * ``memory`` — process-local fallback, только single-worker и только
+      если ``PAYLOAD_STORE_ALLOW_MEMORY_FALLBACK`` явно разрешает его.
+
+    При ``UVICORN_WORKERS > 1`` fallback запрещён независимо от флага:
+    нужны валидный Fernet-ключ и успешный Redis PING.
     """
 
     def __init__(
@@ -58,46 +83,53 @@ class PayloadStore:
         self._ttl = ttl_seconds if ttl_seconds is not None else settings.payload_store_ttl_seconds
         self._max_entries = max_entries
         self._key_prefix = key_prefix if key_prefix is not None else settings.payload_store_key_prefix
-        self._redis = None
-        self.redis_available: bool = False
+        self._redis: Any = None
         self._fernet: Fernet | None = None
+        self.redis_available: bool = False
+        self.ready: bool = False
+        self.mode: str | None = None
         self._records: dict[str, PayloadRecord] = {}
         self._lock = threading.Lock()
         self._inserts_since_evict = 0
         self._evict_interval = 1024
 
     async def initialize(self) -> None:
-        """Инициализация Redis подключения (с fallback на in-memory)."""
-        # Multi-worker без Redis/Fernet запрещён: in-memory fallback не разделяется
-        # между воркерами и ломает идемпотентность/демаскирование.
-        if settings.uvicorn_workers > 1 and (self._redis is None or self._fernet is None):
-            logger.critical(
-                "Multi-worker mode requires Redis and PAYLOAD_STORE_KEY; "
-                "in-memory fallback is only allowed for a single worker"
-            )
-            raise RuntimeError(
-                "Multi-worker mode requires Redis and PAYLOAD_STORE_KEY; "
-                "in-memory fallback is only allowed for a single worker"
-            )
+        """Идемпотентная инициализация. Порядок фиксирован.
 
-        # Ключ шифрования берём только из settings.payload_store_key.
-        key = settings.payload_store_key
+        1. worker count и fallback policy;
+        2. ``PAYLOAD_STORE_KEY``;
+        3. проверка ключа как Fernet и создание Fernet;
+        4. Redis client;
+        5. ``PING``;
+        6. режим: encrypted Redis, разрешённый memory fallback или fatal error.
+        """
+        if self.ready:
+            return
+
+        workers = settings.uvicorn_workers
+        memory_allowed = workers <= 1 and bool(settings.payload_store_allow_memory_fallback)
+        key = (settings.payload_store_key or "").strip()
+
         if not key:
-            logger.warning("PAYLOAD_STORE_KEY is empty, Redis payload store disabled")
-            self._redis = None
-            self.redis_available = False
+            if not memory_allowed:
+                self._fail(
+                    "Multi-worker mode requires PAYLOAD_STORE_KEY and Redis"
+                    if workers > 1
+                    else "PAYLOAD_STORE_KEY is required when memory fallback is disabled"
+                )
+            self._activate_memory()
             return
+
         try:
-            self._fernet = Fernet(key.encode("utf-8"))
+            fernet = Fernet(key.encode("utf-8"))
         except Exception:
-            logger.warning("Invalid PAYLOAD_STORE_KEY, Redis payload store disabled")
-            self._fernet = None
-            self._redis = None
-            self.redis_available = False
-            return
+            self._fail("Invalid PAYLOAD_STORE_KEY")
+
+        client = None
         try:
             import redis.asyncio as aioredis
-            self._redis = aioredis.Redis(
+
+            client = aioredis.Redis(
                 host=settings.redis_host,
                 port=settings.redis_port,
                 db=settings.redis_db,
@@ -106,66 +138,117 @@ class PayloadStore:
                 socket_connect_timeout=settings.redis_socket_connect_timeout,
                 decode_responses=False,
             )
-            await self._redis.ping()
-            self.redis_available = True
-            logger.info("Payload store initialized with Redis")
-        except Exception as e:
-            logger.warning(f"Redis unavailable for payload store, using in-memory: {e}")
-            self._redis = None
-            self.redis_available = False
+            await client.ping()
+        except Exception:
+            if client is not None:
+                with suppress(Exception):
+                    await client.aclose()
+            if not memory_allowed:
+                self._fail("Redis is unavailable for the payload store")
+            self._activate_memory()
+            return
+
+        self._redis = client
+        self._fernet = fernet
+        self.redis_available = True
+        self.mode = MODE_REDIS
+        self.ready = True
+        logger.info("Payload store initialized with Redis")
 
     async def close(self) -> None:
-        if self._redis:
-            await self._redis.aclose()
-            self._redis = None
-            self.redis_available = False
+        """Закрывает Redis и сбрасывает ready/mode, не трогая секреты в логах."""
+        client = self._redis
+        self._redis = None
+        self._fernet = None
+        self.redis_available = False
+        self.mode = None
+        self.ready = False
+        with self._lock:
+            self._records.clear()
+            self._inserts_since_evict = 0
+        if client is not None:
+            await client.aclose()
 
-    async def put(self, payload_id: str, record: PayloadRecord) -> None:
-        """Сохраняет запись соответствия по payload_id (put-if-absent, идемпотентно)."""
-        key = self._key(payload_id)
-        if self._redis is not None and self._fernet is not None:
-            try:
-                plaintext = json.dumps(record.to_dict(), ensure_ascii=False).encode("utf-8")
-                ciphertext = self._fernet.encrypt(plaintext)
-                inserted = await self._redis.set(
-                    key,
-                    ciphertext,
-                    ex=int(self._ttl),
-                    nx=True,
-                )
-                if inserted is False:
-                    # Ключ уже существует — не перезаписываем (идемпотентность).
-                    return
-            except Exception as e:
-                logger.warning(f"Redis payload store put failed, falling back to memory: {e}")
-            else:
-                return
-        self._put_local(payload_id, record)
+    async def put(self, scope: str, payload_id: str, record: PayloadRecord) -> None:
+        """Сохраняет запись (put-if-absent). Режим берётся только из initialize."""
+        if self.mode == MODE_MEMORY:
+            self._put_local(scope, payload_id, record)
+            return
+        redis, fernet = self._require_redis()
+        key = self._redis_key(scope, payload_id)
+        try:
+            plaintext = json.dumps(record.to_dict(), ensure_ascii=False).encode("utf-8")
+            ciphertext = fernet.encrypt(plaintext)
+            await redis.set(key, ciphertext, ex=int(self._ttl), nx=True)
+        except Exception as exc:
+            logger.warning("Payload store write failed (%s)", type(exc).__name__)
+            raise PayloadStoreError("Payload store write failed") from None
 
-    async def get(self, payload_id: str) -> PayloadRecord | None:
-        """Возвращает запись соответствия или None, если её нет/протухла."""
-        key = self._key(payload_id)
-        if self._redis is not None and self._fernet is not None:
-            try:
-                raw = await self._redis.get(key)
-                if raw is not None:
-                    plaintext = self._fernet.decrypt(raw)
-                    return PayloadRecord.from_dict(json.loads(plaintext.decode("utf-8")))
-            except InvalidToken:
-                logger.warning("Payload store record failed to decrypt, falling back to memory")
-            except Exception as e:
-                logger.warning(f"Payload store get failed, falling back to memory: {e}")
-        return self._get_local(payload_id)
+    async def get(self, scope: str, payload_id: str) -> PayloadRecord | None:
+        """Возвращает запись или None. В Redis-режиме local store не читается."""
+        if self.mode == MODE_MEMORY:
+            return self._get_local(scope, payload_id)
+        redis, fernet = self._require_redis()
+        key = self._redis_key(scope, payload_id)
+        try:
+            raw = await redis.get(key)
+        except Exception as exc:
+            logger.warning("Payload store read failed (%s)", type(exc).__name__)
+            raise PayloadStoreError("Payload store read failed") from None
+        if raw is None:
+            return None
+        try:
+            plaintext = fernet.decrypt(raw)
+            parsed = json.loads(plaintext.decode("utf-8"))
+        except Exception as exc:
+            logger.warning("Payload store decrypt failed (%s)", type(exc).__name__)
+            raise PayloadStoreError("Payload store record failed to decrypt") from None
+        if not isinstance(parsed, dict):
+            logger.warning("Payload store decrypt failed (ValueError)")
+            raise PayloadStoreError("Payload store record failed to decrypt")
+        try:
+            return PayloadRecord.from_dict(parsed)
+        except Exception as exc:
+            logger.warning("Payload store decrypt failed (%s)", type(exc).__name__)
+            raise PayloadStoreError("Payload store record failed to decrypt") from None
 
-    def _key(self, payload_id: str) -> str:
-        """Хешированный ключ хранилища. Raw payload_id никогда не используется в ключе."""
-        digest = hashlib.sha256(payload_id.encode("utf-8")).hexdigest()
+    def _require_redis(self) -> tuple[Any, Fernet]:
+        if (
+            self.ready
+            and self.mode == MODE_REDIS
+            and self._redis is not None
+            and self._fernet is not None
+        ):
+            return self._redis, self._fernet
+        raise PayloadStoreError("Payload store is not ready")
+
+    def _fail(self, message: str) -> NoReturn:
+        logger.critical(message)
+        raise RuntimeError(message) from None
+
+    def _activate_memory(self) -> None:
+        self._redis = None
+        self._fernet = None
+        self.redis_available = False
+        self.mode = MODE_MEMORY
+        self.ready = True
+        logger.warning("Payload store using in-memory fallback for a single worker")
+
+    def _redis_key(self, scope: str, payload_id: str) -> str:
+        """SHA-256 от scope и payload_id. Сырые id в ключе Redis не используются."""
+        normalized = normalize_scope(scope)
+        material = normalized.encode("utf-8") + b"\x00" + payload_id.encode("utf-8")
+        digest = hashlib.sha256(material).hexdigest()
         return f"{self._key_prefix}{digest}"
 
-    def _put_local(self, payload_id: str, record: PayloadRecord) -> None:
+    def _memory_key(self, scope: str, payload_id: str) -> str:
+        return normalize_scope(scope) + "\x00" + payload_id
+
+    def _put_local(self, scope: str, payload_id: str, record: PayloadRecord) -> None:
+        memory_key = self._memory_key(scope, payload_id)
         with self._lock:
             # Идемпотентность: если ключ уже есть — не перезаписываем.
-            if payload_id in self._records:
+            if memory_key in self._records:
                 return
             # Амортизированная очистка: полный проход по записям делаем не чаще,
             # чем раз в _evict_interval вставок. Корректность TTL обеспечивает
@@ -174,17 +257,18 @@ class PayloadStore:
             if self._inserts_since_evict >= self._evict_interval:
                 self._evict_expired_locked()
                 self._inserts_since_evict = 0
-            if len(self._records) >= self._max_entries and payload_id not in self._records:
+            if len(self._records) >= self._max_entries and memory_key not in self._records:
                 self._evict_oldest_locked()
-            self._records[payload_id] = record
+            self._records[memory_key] = record
 
-    def _get_local(self, payload_id: str) -> PayloadRecord | None:
+    def _get_local(self, scope: str, payload_id: str) -> PayloadRecord | None:
+        memory_key = self._memory_key(scope, payload_id)
         with self._lock:
-            record = self._records.get(payload_id)
+            record = self._records.get(memory_key)
             if record is None:
                 return None
             if time.monotonic() - record.created_at > self._ttl:
-                del self._records[payload_id]
+                del self._records[memory_key]
                 return None
             return record
 

@@ -1,309 +1,393 @@
-Димастер, [22.09.2026, 21:03:20]:
-ТЗ №3: независимый quality benchmark, настоящий load generator и чистая поставка
-1. Роль
-Ты работаешь как QA/performance engineer и инженер финальной поставки.
-Рабочая ветка: task_C.
-2. Цель
-Сделать качество 95% и 1000 RPS объективно измеряемыми, а репозиторий — пригодным для чистой zip-поставки.
-3. Почему задача нужна
-147/147 pytest не является доказательством качества 95%.
-Оригинальный evaluator:
-сравнивает маску с эталоном через нормированное span-based расстояние Левенштейна;
-проверяет точное восстановление исходника;
-создаёт около 1000 RPS;
-делает до двух retry;
-учитывает Retry-After;
-останавливается после пяти невалидных ответов подряд.
-Текущий load_check.py выполняет запросы последовательно и ошибочно сообщает PASS при примерно 53 RPS.
-4. Исходное состояние
-Уже имеются:
-scripts/load_check.py;
-httpx;
-API /process;
-Prometheus metrics;
-147 тестов;
-ручной длинный round-trip;
-Docker и Redis;
-.gitignore, который уже исключает pyc, хотя 29 pyc ранее были добавлены в Git.
-5. Разрешённые файлы
-Изменять:
-scripts/load_check.py;
-README.
-Создать:
-scripts/quality_benchmark.py;
-benchmarks/pii_quality.jsonl;
-tests/unit/test_load_check.py;
-tests/unit/test_quality_benchmark.py.
-Удалить из Git:
-только уже tracked __pycache__/*.pyc;
-только уже tracked *.pyc.
-.gitignore менять только если обнаружится реально отсутствующее правило. Сейчас необходимые правила уже есть.
-6. Read-only файлы
-Читать можно весь app/, конфигурацию и тесты.
-Особенно:
-app/main.py;
-app/core/pipeline.py;
-detector-файлы;
-Masker;
-tests/integration/test_api.py;
-pyproject.toml;
-Docker Compose.
-7. Запрещённые изменения
-Не менять runtime-код app/.
-Не менять существующие detector unit tests.
-Не менять API и формат маски.
-Не добавлять зависимости.
-Не исправлять detector под benchmark.
-Не копировать только уже существующие unit cases.
-Не включать реальные ПДн в dataset.
-Не добавлять большой dataset или бинарные файлы.
-Не заявлять 1000 RPS без измеренного результата.
-Не включать bonus 2000 RPS в обязательный gate.
-Не делать commit/push без команды.
-8. Quality benchmark
-8.1. Dataset
-Создать компактный синтетический JSONL dataset.
-Каждая запись:
-{
-  "id": "case-001",
-  "text": "Дата рождения: 12.05.1990",
-  "gold_entities": [
-    {
-      "type": "DATE_OF_BIRTH",
-      "start": 15,
-      "end": 25,
-      "text": "12.05.1990"
-    }
-  ],
-  "gold_mask": "Дата рождения: **********",
-  "tags": ["positive", "date", "numeric"]
-}
-Требования:
-только синтетические данные;
-не менее 200 случаев;
-все обязательные типы оригинального ТЗ;
-не менее 8–10 positive вариантов на основной тип;
-минимум 40 negative/false-positive traps;
-минимум 30 mixed cases с несколькими типами;
-различные падежи, регистры, пробелы, Unicode, границы строки;
-минимум 30% случаев не должны быть прямыми копиями unit-тестов.
-Обязательные категории:
-PERSON;
-DATE_OF_BIRTH;
-PLACE_OF_BIRTH;
-PASSPORT;
-CITIZENSHIP;
-PASSPORT_ISSUER;
-PASSPORT_DEPT_CODE;
-PASSPORT_ISSUE_DATE;
-DRIVER_LICENSE;
-ADDRESS;
-EMAIL;
-PHONE;
-INN;
-BANK_CARD;
-CARD_CVV;
-CARD_PIN;
-CARD_HOLDER.
-Negative traps:
-историческая персона;
-адрес банка;
-обычная дата встречи;
-год и статистическое число;
-страна без контекста;
-uppercase географическое название;
-шестизначное число не как индекс;
-номера, похожие одновременно на паспорт/ИНН/карту;
-CVV/PIN без ключевого слова;
-ORG/LOC без персонального контекста.
-Dataset не передавать Developer A/B до фиксации их изменений. Это сохраняет характер blind validation.
-8.2. Метрики
-Считать exact entity key:
-(entity_type, start, end)
-Для каждого типа и в целом:
-TP;
-FP;
-FN;
-Precision;
-Recall;
-F1.
-Вывести:
-micro Precision/Recall/F1;
-macro Precision/Recall/F1;
-per-entity таблицу;
-число invalid spans;
-число случаев с нарушением text == source[start:end];
-negative-case false-positive rate.
-Дополнительно считать:
-exact mask match rate;
-normalized full-mask Levenshtein similarity:
-1 - distance(predicted_mask, gold_mask) / max(lengths);
-exact demask rate в HTTP-режиме.
-Не называть full-mask metric точной официальной реализацией. В отчёте обозначить её как proxy: PDF не раскрывает точную формулу «span-based Levenshtein» и способ агрегирования 95%.
-8.3. Режимы
-Поддержать:
-in-process mode:
-CascadeDetector;
-существующий Masker;
-gold span/type metrics.
-HTTP mode:
-первый /process получает исходник;
-второй — полученную маску с тем же ID;
-сравниваются маска и точный исходник.
-8.4. Quality gate
-CLI должен поддерживать явные пороги.
-Рекомендуемый финальный gate:
-mean mask similarity proxy ≥ 0.95;
-micro exact-span F1 ≥ 0.95;
-macro F1 ≥ 0.90;
-demask exact rate = 1.0;
-invalid spans = 0;
-invariant violations = 0;
-negative false-positive rate ≤ 0.05.
-Если оригинальная формула станет доступна, заменить proxy на неё до сдачи.
-9. Load generator
-9.1. Генерация нагрузки
-Переделать load_check.py на open-loop scheduling:
-планировать запросы по времени с target RPS;
-не ждать завершения предыдущего запроса;
-использовать bounded queue/semaphore;
-настраивать max_connections, max_keepalive_connections, concurrency;
-не создавать отдельный HTTP client на запрос;
-ограничивать память через max in-flight;
-отдельно проводить mask- и demask-фазы;
-payload IDs уникальны в рамках прогона.
-9.2. Retry semantics
-максимум две повторные попытки;
-учитывать Retry-After для 429;
-429 не увеличивает и не сбрасывает consecutive-invalid counter;
-успешный ответ сбрасывает counter;
-network error, malformed response, 4xx кроме 429 и 5xx считаются invalid;
-после пяти consecutive invalid запросов остановить прогон;
-demask не запускать для mask case, который окончательно не прошёл.
-9.3. Метрики
-Печатать минимум:
-target RPS;
-scheduled requests;
-started/completed requests;
-achieved scheduling RPS;
-achieved completion RPS;
-success;
-retried requests;
-final 429;
-4xx;
-5xx;
-network errors;
-max consecutive invalid;
-mask latency p50/p95/p99/max;
-demask latency p50/p95/p99/max;
-fraction latency > 1 second;
-demask mismatches;
-elapsed wall time;
-peak in-flight.
-9.4. PASS/FAIL
-Strict PASS требует:
-scheduled mask requests ≥ 95% от rps × duration;
-achieved completed mask RPS ≥ 95% target;
-mask p95 ≤ 1 секунда;
-demask p95 ≤ 1 секунда;
-0 demask mismatches;
-0 final 5xx;
-0 final 429 после retry;
-max consecutive invalid < 5;
-валидный JSON-контракт всех 200-ответов.
-Вывести причины FAIL по отдельности.
-Нельзя выдавать PASS только потому, что не было пяти 5xx подряд.
-10. Unit tests
-test_quality_benchmark.py
-Проверить:
-TP/FP/FN на искусственном примере;
-micro и macro;
-zero-division;
-exact span/type;
-Levenshtein: identical=1, fully different=0;
-schema dataset;
-gold text/offset invariant;
-gold mask соответствует spans;
-duplicate/overlapping gold entities отклоняются;
-CLI gate возвращает правильный exit code.
-test_load_check.py
-Без реального сервера проверить через MockTransport/fake clock:
-реально существует больше одного in-flight запроса;
-scheduler создаёт ожидаемое число слотов;
-semaphore ограничивает concurrency;
-Retry-After;
-максимум две retry;
-правило пяти invalid;
-429 не сбрасывает invalid counter;
-success сбрасывает;
-mismatch вызывает FAIL;
-низкий achieved RPS вызывает FAIL;
-высокий p95 вызывает FAIL;
-корректный прогон возвращает 0.
-Тесты не должны зависеть от wall-clock настолько, чтобы быть flaky.
-11. Git hygiene и README
-Удалить все tracked pyc/pycache.
-README обновить только в своей области:
-команды quality benchmark;
-команды strict load test;
-описание метрик;
-честное замечание, что 1000 RPS подтверждается только конкретным отчётом;
-уточнить, что active runtime settings идут из environment/.env, а pii_rules.yaml — из YAML;
-не заявлять settings.yaml активным, если код его не читает;
-сохранить инструкцию настройки систем не длиннее пяти предложений;
-не переписывать README целиком.
-12. Acceptance criteria
-DONE, если:
-benchmark покрывает все 17 типов;
-dataset проходит schema/invariant validation;
-рассчитываются все требуемые метрики;
-load generator действительно конкурентный;
-PASS зависит от фактического RPS и latency;
-unit tests benchmark/load проходят;
-полный pytest проходит;
-tracked pyc отсутствуют;
-README не содержит неподтверждённой декларации 1000 RPS;
-git diff --check проходит;
-runtime-файлы app/ не изменены.
+# ТЗ №2 — PayloadStore, Redis, multi-worker и безопасный storage lifecycle
 
+Рекомендуемая ветка: `task_storage`.
 
-Baseline может не пройти quality gate до merge task_A/task_B. Это допустимо; разработчик C обязан честно зафиксировать результат, а не подгонять dataset.
-13. Команды проверки
-python -m pytest tests/unit/test_quality_benchmark.py tests/unit/test_load_check.py -v
+## 1. Роль разработчика
+
+Backend/Infrastructure engineer с опытом Redis, async Python, шифрования и multi-worker deployment.
+
+## 2. Главная цель
+
+Сделать storage lifecycle корректным и доказуемым:
+
+`configuration → Fernet → Redis → worker policy → ready state`.
+
+При нескольких workers Redis и шифрование обязательны; process-local fallback невозможен. Два независимых экземпляра Pipeline/PayloadStore должны выполнять точный mask → demask round-trip через общее Redis-хранилище.
+
+## 3. Почему это нужно
+
+Текущий BLOCKER:
+
+- multi-worker check выполняется до чтения `PAYLOAD_STORE_KEY`;
+- до создания Fernet;
+- до подключения и ping Redis;
+- поэтому `UVICORN_WORKERS > 1` немедленно получает `RuntimeError`, даже если конфигурация правильная.
+
+Дополнительные проблемы:
+
+- пустой ключ приводит к plaintext memory storage;
+- Redis runtime error тихо переключает worker на local memory;
+- такой fallback ломает cross-worker round-trip;
+- нет теста двух независимых workers/stores;
+- TTL и NX проверены не полностью;
+- `payload_id` не изолирован по `system_id`;
+- Docker default допускает запуск без encryption key;
+- README обещает более сильные гарантии, чем default runtime.
+
+## 4. Scope
+
+Разрешено изменять только:
+
+- `app/core/payload_store.py`
+- `app/core/pipeline.py`
+- `app/config/settings.py`
+- `docker/docker-compose.yml`
+- `.env.example`
+- `tests/unit/test_payload_store.py`
+- `tests/unit/test_pipeline.py`
+
+Разрешено создать:
+
+- `tests/integration/test_storage_roundtrip.py`
+
+Если требуется отдельный тип storage-ошибки, он должен находиться в `app/core/payload_store.py`, а не в новом общем модуле.
+
+## 5. Read-only files
+
+Можно читать, но нельзя менять:
+
+- `app/main.py`
+- `app/models/request.py`
+- `app/models/pii.py`
+- `app/core/masker.py`
+- все `app/detectors/*`
+- `app/services/rate_limiter.py`
+- `app/utils/sanitizer.py`
+- `app/utils/logging_setup.py`
+- `app/middleware/logging_middleware.py`
+- `app/config/pii_rules.yaml`
+- `tests/integration/test_api.py`
+- `scripts/quality_benchmark.py`
+- `scripts/load_check.py`
+- `benchmarks/pii_quality.jsonl`
+- `README.md`
+- `pyproject.toml`
+- `tz.md`
+- detection- и benchmark-тесты.
+
+## 6. Forbidden scope
+
+Запрещено:
+
+- менять API `POST /process`;
+- менять request/response schema;
+- менять правила детекции;
+- менять Masker;
+- менять benchmark dataset;
+- добавлять зависимости;
+- переписывать rate limiter;
+- логировать original, mask, entity text, encryption key или raw payload_id;
+- хардкодить Fernet key;
+- автоматически генерировать новый key при каждом worker startup;
+- тихо переходить на memory в multi-worker;
+- использовать разные storage keys для разных workers;
+- ослаблять idempotency/NX;
+- менять README — его единственный writer в этом спринте ТЗ №3;
+- делать commit/push без команды.
+
+## 7. Технические требования
+
+### 7.1. Явная policy конфигурации
+
+Добавить настройку:
+
+`PAYLOAD_STORE_ALLOW_MEMORY_FALLBACK`
+
+Рекомендуемый контракт:
+
+- application default может разрешать fallback для локальной single-worker разработки, чтобы сохранить существующий developer flow;
+- Docker/production Compose обязан устанавливать `false`;
+- при `UVICORN_WORKERS > 1` значение этого флага игнорируется: Redis+Fernet обязательны всегда;
+- `.env.example` объясняет назначение флага без реального секрета.
+
+Не использовать неактивный `settings.yaml`.
+
+### 7.2. Правильный initialize lifecycle
+
+Порядок:
+
+1. Прочитать worker count и fallback policy.
+2. Прочитать `PAYLOAD_STORE_KEY`.
+3. Если key задан — проверить его как Fernet key.
+4. Создать Fernet.
+5. Создать Redis client.
+6. Выполнить `PING`.
+7. Только после этого определить режим:
+   - encrypted Redis ready;
+   - разрешённый local-dev memory fallback;
+   - fatal configuration/dependency error.
+8. Установить согласованное ready/state поле.
+
+Multi-worker:
+
+- missing key → startup error;
+- invalid key → startup error;
+- Redis unavailable → startup error;
+- Redis ping failure → startup error;
+- успешный key+Redis → startup succeeds;
+- ошибка не должна содержать key, original или mask.
+
+Single-worker:
+
+- key+Redis → encrypted Redis;
+- fallback разрешён и Redis/key отсутствует → local memory с одним безопасным warning;
+- fallback запрещён → startup error;
+- invalid key при явно заданном key не должен молча трактоваться как «ключ отсутствует».
+
+Initialize остаётся идемпотентным.
+
+### 7.3. Runtime Redis failure policy
+
+Для strict/production или multi-worker режима:
+
+- `put/get` Redis failure не переключает worker на local memory;
+- операция завершается контролируемой storage/pipeline error;
+- сервис не создаёт divergent process-local запись;
+- ошибка не раскрывает данные.
+
+Для явно разрешённого single-worker local-dev fallback:
+
+- допускается локальное хранение;
+- режим должен быть предсказуем и протестирован;
+- не смешивать частично успешную Redis-запись и локальную запись без формального правила.
+
+Рекомендуется зафиксировать storage mode при initialize и не менять его скрыто на каждом запросе.
+
+### 7.4. Encryption и Redis representation
+
+Сохранить и проверить:
+
+- Fernet;
+- key только из environment/settings;
+- Redis value содержит только ciphertext;
+- original и masked text не присутствуют в Redis value в UTF-8;
+- Redis key не содержит raw payload_id;
+- key использует SHA-256;
+- `SET NX`;
+- TTL задаётся через `EX`;
+- повторный `put` не перезаписывает запись;
+- decrypt failure не приводит к возврату мусора или local stale record.
+
+### 7.5. Namespace по system_id
+
+Устранить cross-system collision:
+
+- storage identity должна включать нормализованный system scope;
+- запрос без `X-System-Id` использует стабильный scope, например `checker`;
+- один `payload_id` в разных system scopes не должен читать или перезаписывать чужую запись;
+- raw system ID и payload ID не должны попадать в Redis key или лог без хеширования;
+- mask и demask обязаны использовать один и тот же scope;
+- не менять внешний API-контракт.
+
+Возможная сигнатура:
+
+- `put(scope, payload_id, record)`
+- `get(scope, payload_id)`
+
+или эквивалентный внутренний key object.
+
+### 7.6. Pipeline testability и два worker-like экземпляра
+
+Разрешён минимальный dependency injection:
+
+- `Pipeline` может принимать `PayloadStore` через constructor;
+- default остаётся глобальный production store;
+- существующие callers не меняются.
+
+Это нужно для теста:
+
+1. Pipeline A маскирует original.
+2. Store A пишет encrypted record в общий fake/shared Redis.
+3. Pipeline B имеет другой объект PayloadStore.
+4. Store B читает ту же Redis-запись.
+5. Pipeline B получает mask с тем же payload_id/scope.
+6. Возвращается исходная строка посимвольно.
+
+Нельзя доказывать cross-worker только повторным вызовом одного глобального объекта.
+
+### 7.7. Docker policy
+
+`docker/docker-compose.yml`:
+
+- production-like API не запускается без явно переданного `PAYLOAD_STORE_KEY`;
+- key не имеет default literal;
+- `PAYLOAD_STORE_ALLOW_MEMORY_FALLBACK=false`;
+- Redis остаётся `noeviction`;
+- TTL больше времени load test;
+- worker count читается из `UVICORN_WORKERS`;
+- после исправления должна поддерживаться конфигурация нескольких workers;
+- секрет не печатается и не записывается в image.
+
+Не менять load generator.
+
+### 7.8. Logging и sanitizer
+
+Сохранить:
+
+- raw payload_id отсутствует в логах;
+- original/mask отсутствуют в логах;
+- ciphertext не логируется;
+- key не логируется;
+- exception detail с Redis не должен включать command arguments/value;
+- entity text не логируется;
+- pipeline продолжает логировать только безопасные типы и counts.
+
+## 8. Regression requirements
+
+Не сломать:
+
+- mask → demask для default checker;
+- повтор исходника возвращает ту же маску;
+- чужой текст с известным payload_id не перезаписывает пару;
+- `demask_enabled=false`;
+- entity limit;
+- allowed entity types;
+- payload_id sanitization;
+- exact restored string;
+- TTL local store;
+- NX semantics;
+- Redis hash key;
+- полный single-worker test flow;
+- API contract;
+- quality benchmark и detector output.
+
+## 9. Новые тесты
+
+`test_payload_store.py`:
+
+- multi-worker + valid Fernet key + успешный fake Redis ping → initialize success;
+- multi-worker + missing key → RuntimeError;
+- multi-worker + invalid key → RuntimeError;
+- multi-worker + Redis unavailable → RuntimeError;
+- multi-worker runtime `put` failure → error, local record не создаётся;
+- multi-worker runtime `get` failure → error, local record не читается;
+- single-worker + explicitly allowed fallback → memory works;
+- single-worker + fallback disabled + missing key → startup error;
+- invalid explicit key не деградирует в memory;
+- ciphertext не содержит original/mask;
+- raw payload_id и raw system ID не входят в Redis key;
+- одинаковый payload_id в двух system scopes создаёт разные keys;
+- TTL передаётся точно;
+- NX предотвращает overwrite;
+- decrypt failure возвращает контролируемую ошибку;
+- initialize идемпотентен;
+- close корректно сбрасывает state.
+
+`test_pipeline.py` / новый integration test:
+
+- два разных PayloadStore с одним shared fake Redis;
+- mask через Pipeline A;
+- demask через Pipeline B;
+- exact Unicode/Cyrillic round-trip;
+- тот же payload_id в другом system scope не раскрывает original;
+- retry original через другой store возвращает ту же mask;
+- production storage error преобразуется в безопасный `PipelineError`;
+- логи не содержат original/mask/raw payload_id/key.
+
+Fake Redis должен моделировать:
+
+- `ping`;
+- shared data;
+- `SET NX EX`;
+- `GET`;
+- `aclose`;
+- при необходимости проверяемый TTL metadata.
+
+Не добавлять Docker/testcontainers dependency.
+
+## 10. Команды проверки
+
+Scoped:
+
+```bash
+python -m pytest tests/unit/test_payload_store.py tests/unit/test_pipeline.py -v
+python -m pytest tests/integration/test_storage_roundtrip.py -v
+```
+
+Regression:
+
+```bash
+python -m pytest tests/integration/test_api.py -v
 python -m pytest -v
+```
 
-python scripts/quality_benchmark.py `
-  --dataset benchmarks/pii_quality.jsonl `
-  --min-mask-similarity 0.95 `
-  --min-micro-f1 0.95 `
-  --min-macro-f1 0.90
+Docker startup после реализации:
 
-python scripts/load_check.py `
-  --base-url http://127.0.0.1:8000 `
-  --rps 1000 `
-  --duration 30 `
-  --concurrency 2000 `
-  --strict
+```powershell
+$env:PAYLOAD_STORE_KEY = "<valid-Fernet-key>"
+$env:UVICORN_WORKERS = "2"
+docker compose -f docker/docker-compose.yml up --build
+```
 
-git ls-files | Select-String -Pattern '(__pycache__|\.pyc$)'
+Проверить:
+
+```bash
+curl http://127.0.0.1:8000/health
+```
+
+Cross-worker runtime допускается проверять серией mask/demask запросов с несколькими уникальными payload_id. Финальный 1000 RPS выполняется после merge ТЗ №3.
+
+Контроль:
+
+```bash
+git diff -- benchmarks/pii_quality.jsonl
 git diff --check
 git status --short
-На Linux:
-git ls-files | grep -E '(__pycache__|\.pyc$)'
-Ожидаемый результат поиска tracked artifacts — пустой.
-14. Отчёт разработчика
-Верни:
-описание dataset и распределение по типам;
-формулы метрик;
-оговорку о proxy для официальной метрики;
-baseline и итоговые quality metrics;
-target и achieved RPS;
-p50/p95/p99;
-ошибки/429/5xx/mismatches;
-параметры машины и Docker;
-список изменённых/удалённых файлов;
-результаты тестов;
-git diff --check;
-git status --short;
-ограничения benchmark и load test.
-Commit и push не выполнять без отдельной команды.
+```
+
+## 11. Acceptance criteria
+
+- valid key + available Redis + workers=2 успешно инициализируются;
+- missing/invalid key при workers>1 вызывает fail-fast;
+- unavailable Redis при workers>1 вызывает fail-fast;
+- production Docker не допускает memory fallback;
+- runtime Redis failure в multi-worker не создаёт local record;
+- Redis values зашифрованы;
+- TTL=3600 либо актуальное настроенное значение;
+- NX/idempotency сохранены;
+- два независимых store/pipeline объекта выполняют exact cross-store round-trip;
+- system scope изолирует одинаковые payload_id;
+- raw payload_id, original, mask и key отсутствуют в логах/Redis keys;
+- API не изменён;
+- полный pytest: `203 + новые тесты`, 0 failed;
+- benchmark dataset не изменён;
+- изменения ограничены scope.
+
+## 12. Definition of Done
+
+Разработчик возвращает:
+
+- диаграмму/описание итогового lifecycle;
+- root cause прежнего pre-initialization check;
+- выбранную memory fallback policy;
+- поведение для каждой комбинации workers/key/Redis/fallback;
+- список изменённых файлов;
+- новые тесты и их результаты;
+- доказательство encrypted value;
+- доказательство cross-store round-trip;
+- Docker startup result с несколькими workers;
+- известные ограничения;
+- полный pytest;
+- `git diff --check`;
+- `git status --short`;
+- инструкции для ТЗ №3, какие environment variables документировать.
+
+Commit и push — только по отдельной команде.
+
+AIL: completion RPS 282 < 950, mask p95 и demask p95 больше 1 с. 1000 RPS этим прогоном не подтверждены.
+
+Контрольный strict-прогон 100 RPS × 3 с, concurrency 50, прошёл: completion RPS 100.14, mask p95 0.018 с, demask p95 0.150 с, mismatches 0.
+
+Машина: darwin arm64, 10 CPU, Python 3.14.5. Docker Compose в репозитории задаёт API и Redis 7 с `maxmemory 1gb` и `noeviction`; этот замер шёл против локального процесса без Redis.
+
+##

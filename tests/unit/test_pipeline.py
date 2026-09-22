@@ -69,7 +69,7 @@ async def test_store_keeps_record(pipeline, sample_text):
     """Запись хранит исходник, маску и типы сущностей."""
     payload_id = "unit-record-1"
     masked = await pipeline.process(sample_text, payload_id)
-    record = await payload_store.get(payload_id)
+    record = await payload_store.get("checker", payload_id)
     assert record is not None
     assert record.original_text == sample_text
     assert record.masked_text == masked
@@ -85,7 +85,7 @@ async def test_foreign_text_returns_saved_mask(pipeline, sample_text):
     result = await pipeline.process(other, payload_id)
     assert result == masked
     # Сохранённая пара не перезаписана
-    record = await payload_store.get(payload_id)
+    record = await payload_store.get("checker", payload_id)
     assert record is not None
     assert record.original_text == sample_text
     assert record.masked_text == masked

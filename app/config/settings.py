@@ -54,6 +54,9 @@ class AppSettings(BaseSettings):
     payload_store_ttl_seconds: int = 3600
     payload_store_key_prefix: str = "pii_gateway:payload:"
     payload_store_key: str = ""
+    # Локальный fallback только для single-worker разработки.
+    # При UVICORN_WORKERS > 1 флаг игнорируется: обязательны Redis и Fernet.
+    payload_store_allow_memory_fallback: bool = True
 
     # Detector
     natasha_enabled: bool = True
