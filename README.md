@@ -125,13 +125,15 @@ Prometheus метрики: latency, RPS, tokens per second, счётчик су�
 pytest
 ```
 
-## Quality benchmark
+## Quality & Load Testing
+
+### Quality benchmark
 
 Независимый датасет `benchmarks/pii_quality.jsonl` — синтетические случаи, не копия unit-тестов. Скрипт считает exact-span TP/FP/FN, micro/macro Precision/Recall/F1, exact mask match, долю ложных срабатываний на negative-кейсах, число битых спанов и нарушений `text == source[start:end]`.
 
 `mean_mask_similarity_proxy` — это `1 - levenshtein(predicted_mask, gold_mask) / max(len)`. Это proxy: PDF проверки не раскрывает точную формулу span-based Levenshtein и способ агрегации порога 95%.
 
-In-process режим сравнивает `CascadeDetector` и `Masker` с gold-спанами. С `--base-url` маска и точное восстановление исходника измеряются двумя вызовами `POST /process` с одним `payload_id`.
+**Quality in-process** (сравнивает `CascadeDetector` и `Masker` с gold-спанами):
 
 ```bash
 python scripts/quality_benchmark.py \
@@ -143,13 +145,26 @@ python scripts/quality_benchmark.py \
   --min-demask-exact 1.0
 ```
 
+**Quality HTTP** (маска и точное восстановление исходника измеряются двумя вызовами `POST /process` с одним `payload_id`):
+
+```bash
+python scripts/quality_benchmark.py \
+  --dataset benchmarks/pii_quality.jsonl \
+  --base-url http://127.0.0.1:8000 \
+  --min-mask-similarity 0.95 \
+  --min-micro-f1 0.95 \
+  --min-macro-f1 0.90 \
+  --max-negative-fp 0.05 \
+  --min-demask-exact 1.0
+```
+
 Порог 95% подтверждается только напечатанным отчётом этого прогона. Датасет намеренно не подгоняется под текущие детекторы.
 
-## Нагрузочная проверка
+### Load check (strict)
 
 `scripts/load_check.py` планирует маскирование open-loop с целевым RPS, одним HTTP-клиентом и ограничением in-flight. Затем отдельно демаскирует только успешные `payload_id`. До двух retry, `Retry-After` для 429, остановка после пяти невалидных ответов подряд. 429 не двигает счётчик невалидных ответов.
 
-PASS с флагом `--strict` требует фактический completed RPS и p95 latency, ноль расхождений демаскирования, ноль финальных 429/5xx и валидный JSON `{result}`. Цифра 1000 RPS считается достигнутой только если конкретный strict-отчёт это показал. Прогон на 2000 RPS в обязательный gate не входит.
+**Strict Load:**
 
 ```bash
 python scripts/load_check.py \
@@ -159,6 +174,23 @@ python scripts/load_check.py \
   --concurrency 2000 \
   --strict
 ```
+
+PASS с флагом `--strict` требует фактический completed RPS и p95 latency, ноль расхождений демаскирования, ноль финальных 429/5xx и валидный JSON `{result}`.
+
+> **1000 RPS считается достигнутым только при прохождении strict gate с printed report.** Цифра 2000 RPS не публикуется как достигнутая, пока конкретный strict-отчёт этого не показал.
+
+### Глоссарий RPS
+
+- **Target RPS** — целевая интенсивность планирования, задаётся флагом `--rps`. Это сколько запросов скрипт *пытается* запустить в секунду.
+- **Scheduled RPS** — фактическая скорость, с которой скрипт *запланировал* слоты (запросы поставлены в очередь). Может быть ниже target при остановке из-за невалидных ответов.
+- **Completed RPS** — фактическая скорость, с которой запросы *завершились* (получен ответ). Это главная метрика пропускной способности: она падает при медленных ответах и ограничении concurrency.
+- **Success RPS** — скорость успешных запросов (валидный `{result}`). Учитывает только успехи, без 429/5xx/network/contract-ошибок.
+
+Strict gate проверяет именно **completed RPS** (≥ 95% от target) и p95 latency, а не только scheduled.
+
+### Предупреждение о storage
+
+> **Multi-worker режим требует валидного `PAYLOAD_STORE_KEY` и доступного Redis.** В single-worker режиме допускается in-memory fallback, но шифрование не гарантируется.
 
 ## Безопасность
 

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 from argparse import Namespace
 from pathlib import Path
@@ -14,6 +15,7 @@ from scripts.quality_benchmark import (
     GoldEntity,
     Prediction,
     TypeScore,
+    _calculate_f1,
     gate_failures,
     levenshtein,
     load_dataset,
@@ -24,6 +26,7 @@ from scripts.quality_benchmark import (
     score_keys,
     summarize,
     validate_dataset,
+    verify_dataset_hash,
 )
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -61,6 +64,9 @@ def _entity(text: str, needle: str, entity_type: str) -> GoldEntity:
 def _metrics(**overrides: object) -> BenchmarkMetrics:
     metrics = BenchmarkMetrics(
         case_count=1,
+        positive_cases=1,
+        negative_cases=0,
+        gold_entity_count=1,
         micro=TypeScore(tp=1),
         macro_precision=1.0,
         macro_recall=1.0,
@@ -69,7 +75,6 @@ def _metrics(**overrides: object) -> BenchmarkMetrics:
         invalid_spans=0,
         invariant_violations=0,
         negative_fp_rate=0.0,
-        negative_cases=1,
         negative_fp_cases=0,
         exact_mask_match_rate=1.0,
         mean_mask_similarity=1.0,
@@ -122,21 +127,109 @@ def test_micro_and_macro_match_manual_example() -> None:
     assert micro.recall == pytest.approx(0.5)
     assert micro.f1 == pytest.approx(0.5)
     macro_precision, macro_recall, macro_f1 = macro_averages(per_type)
-    assert macro_precision == pytest.approx((1.0 + 1.0 + 0.0) / 3)
-    assert macro_recall == pytest.approx((1.0 + 0.0 + 1.0) / 3)
+    assert macro_precision == pytest.approx((1.0 + 0.0 + 0.0) / 3)
+    assert macro_recall == pytest.approx((1.0 + 0.0 + 0.0) / 3)
     assert macro_f1 == pytest.approx((1.0 + 0.0 + 0.0) / 3)
 
 
 def test_zero_division_is_defined() -> None:
     empty = micro_score({})
-    assert empty.precision == 1.0
-    assert empty.recall == 1.0
-    assert empty.f1 == 1.0
+    assert empty.precision == 0.0
+    assert empty.recall == 0.0
+    assert empty.f1 == 0.0
     assert macro_averages({}) == (1.0, 1.0, 1.0)
     only_fp = TypeScore(fp=1)
     assert only_fp.precision == 0.0
-    assert only_fp.recall == 1.0
+    assert only_fp.recall == 0.0
     assert only_fp.f1 == 0.0
+
+
+def test_f1_perfect() -> None:
+    assert _calculate_f1(tp=1, fp=0, fn=0) == pytest.approx(1.0)
+    score = TypeScore(tp=1, fp=0, fn=0)
+    assert score.precision == pytest.approx(1.0)
+    assert score.recall == pytest.approx(1.0)
+    assert score.f1 == pytest.approx(1.0)
+
+
+def test_f1_only_fp() -> None:
+    assert _calculate_f1(tp=0, fp=1, fn=0) == pytest.approx(0.0)
+    score = TypeScore(tp=0, fp=1, fn=0)
+    assert score.precision == pytest.approx(0.0)
+    assert score.recall == pytest.approx(0.0)
+    assert score.f1 == pytest.approx(0.0)
+
+
+def test_f1_only_fn() -> None:
+    assert _calculate_f1(tp=0, fp=0, fn=1) == pytest.approx(0.0)
+    score = TypeScore(tp=0, fp=0, fn=1)
+    assert score.precision == pytest.approx(0.0)
+    assert score.recall == pytest.approx(0.0)
+    assert score.f1 == pytest.approx(0.0)
+
+
+def test_f1_tp_zero_fp_and_fn_present() -> None:
+    assert _calculate_f1(tp=0, fp=1, fn=1) == pytest.approx(0.0)
+    score = TypeScore(tp=0, fp=1, fn=1)
+    assert score.precision == pytest.approx(0.0)
+    assert score.recall == pytest.approx(0.0)
+    assert score.f1 == pytest.approx(0.0)
+
+
+def test_f1_half_precision() -> None:
+    assert _calculate_f1(tp=5, fp=5, fn=0) == pytest.approx(2.0 / 3.0)
+    assert _calculate_f1(tp=5, fp=0, fn=5) == pytest.approx(2.0 / 3.0)
+
+
+def test_f1_empty_gold_empty_prediction() -> None:
+    per_type = score_keys(set(), set())
+    assert per_type == {}
+    micro = micro_score(per_type)
+    assert micro.tp == 0
+    assert micro.fp == 0
+    assert micro.fn == 0
+    assert macro_averages(per_type) == (1.0, 1.0, 1.0)
+
+
+def test_type_mismatch_counts_fp_and_fn() -> None:
+    gold = {("PERSON", 0, 5)}
+    predicted = {("ADDRESS", 0, 5)}
+    per_type = score_keys(gold, predicted)
+    assert per_type["PERSON"].fn == 1
+    assert per_type["PERSON"].tp == 0
+    assert per_type["ADDRESS"].fp == 1
+    assert per_type["ADDRESS"].tp == 0
+    micro = micro_score(per_type)
+    assert (micro.tp, micro.fp, micro.fn) == (0, 1, 1)
+    assert micro.f1 == pytest.approx(0.0)
+
+
+def test_verify_dataset_hash_matches(tmp_path: Path) -> None:
+    dataset = tmp_path / "good.jsonl"
+    dataset.write_bytes(b"line1\nline2\n")
+    expected = hashlib.sha256(b"line1\nline2\n").hexdigest()
+    verify_dataset_hash(dataset, expected)
+
+
+def test_verify_dataset_hash_mismatch_raises(tmp_path: Path) -> None:
+    dataset = tmp_path / "bad.jsonl"
+    dataset.write_bytes(b"tampered content")
+    with pytest.raises(ValueError, match="dataset hash mismatch"):
+        verify_dataset_hash(dataset, "0" * 64)
+
+
+def test_verify_dataset_hash_uses_module_default(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    dataset = tmp_path / "default.jsonl"
+    dataset.write_bytes(b"payload")
+    digest = hashlib.sha256(b"payload").hexdigest()
+    monkeypatch.setattr("scripts.quality_benchmark.DATASET_SHA256", digest)
+    verify_dataset_hash(dataset)
+
+
+def test_verify_dataset_hash_missing_file(tmp_path: Path) -> None:
+    missing = tmp_path / "nope.jsonl"
+    with pytest.raises(FileNotFoundError):
+        verify_dataset_hash(missing)
 
 
 def test_levenshtein_similarity_bounds() -> None:
@@ -234,6 +327,12 @@ def test_cli_gate_exit_codes(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) ->
         "tags": ["negative"],
     }
     dataset.write_text(json.dumps(payload, ensure_ascii=False) + "\n", encoding="utf-8")
+    import hashlib
+
+    monkeypatch.setattr(
+        "scripts.quality_benchmark.DATASET_SHA256",
+        hashlib.sha256(dataset.read_bytes()).hexdigest(),
+    )
     args = [
         "--dataset",
         str(dataset),
