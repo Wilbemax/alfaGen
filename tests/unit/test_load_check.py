@@ -339,3 +339,105 @@ async def test_correct_run_passes_strict_gate() -> None:
     assert report.max_consecutive_invalid < 5
     assert report.passed is True
     assert len(calls) == 10
+
+
+async def test_retry_500_then_200_counts_attempts() -> None:
+    clock = VirtualClock()
+    attempts: dict[str, int] = defaultdict(int)
+    originals: dict[str, str] = {}
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content.decode())
+        payload_id = body["payload_id"]
+        payload = body["payload"]
+        if payload_id not in originals:
+            originals[payload_id] = payload
+        attempt = attempts[payload_id]
+        attempts[payload_id] += 1
+        if attempt == 0:
+            return httpx.Response(500)
+        if payload == originals[payload_id]:
+            return httpx.Response(200, json={"result": "*" * len(payload)})
+        return httpx.Response(200, json={"result": originals[payload_id]})
+
+    report = await run_load(
+        _config(rps=1, duration=1, concurrency=1),
+        transport=httpx.MockTransport(handler),
+        clock=clock,
+    )
+    assert report.mask_logical_scheduled == 1
+    assert report.mask_logical_completed == 1
+    assert report.mask_success == 1
+    assert report.mask_http_attempts == 2
+    assert report.final_5xx == 0
+
+
+async def test_five_consecutive_5xx_stops_scheduling() -> None:
+    clock = VirtualClock()
+    calls = {"count": 0}
+
+    async def handler(_request: httpx.Request) -> httpx.Response:
+        calls["count"] += 1
+        return httpx.Response(500)
+
+    report = await run_load(
+        _config(rps=10, duration=2, concurrency=1, strict=False),
+        transport=httpx.MockTransport(handler),
+        clock=clock,
+    )
+    assert report.max_consecutive_5xx == 5
+    assert report.max_consecutive_invalid == 5
+    assert report.mask_logical_scheduled == 5
+    assert report.passed is False
+    assert any("consecutive invalid" in reason for reason in report.reasons)
+
+
+async def test_strict_gate_fails_on_low_throughput() -> None:
+    clock = VirtualClock()
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        await clock.sleep(2.0)
+        body = json.loads(request.content.decode())
+        return httpx.Response(200, json={"result": body["payload"]})
+
+    report = await run_load(
+        _config(rps=1000, duration=1, concurrency=1),
+        transport=httpx.MockTransport(handler),
+        clock=clock,
+    )
+    assert report.mask_achieved_completion_rps < 0.95 * report.target_rps
+    assert report.passed is False
+    assert any("achieved completion RPS" in reason for reason in report.reasons)
+
+
+async def test_mask_and_demask_counters_are_separate() -> None:
+    clock = VirtualClock()
+    originals: dict[str, str] = {}
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content.decode())
+        payload_id = body["payload_id"]
+        payload = body["payload"]
+        if payload_id not in originals:
+            originals[payload_id] = payload
+            return httpx.Response(200, json={"result": "*" * len(payload)})
+        if payload == "*" * len(originals[payload_id]):
+            return httpx.Response(200, json={"result": originals[payload_id]})
+        return httpx.Response(200, json={"result": "WRONG"})
+
+    report = await run_load(
+        _config(rps=4, duration=1, concurrency=2),
+        transport=httpx.MockTransport(handler),
+        clock=clock,
+    )
+    assert report.mask_logical_scheduled == 4
+    assert report.mask_logical_completed == 4
+    assert report.mask_success == 4
+    assert report.demask_logical_scheduled == 4
+    assert report.demask_logical_completed == 4
+    assert report.demask_success == 4
+    assert report.demask_mismatches == 0
+    assert report.mask_http_attempts == 4
+    assert report.demask_http_attempts == 4
+    assert report.http_attempts == 8
+    assert report.success == 4

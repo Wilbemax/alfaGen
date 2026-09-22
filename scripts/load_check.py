@@ -137,30 +137,55 @@ class LoadReport:
     target_rps: float
     duration: float
     strict: bool
+    # mask phase
+    mask_logical_scheduled: int = 0
+    mask_logical_started: int = 0
+    mask_logical_completed: int = 0
+    mask_http_attempts: int = 0
+    mask_success: int = 0
+    mask_final_429: int = 0
+    mask_final_5xx: int = 0
+    mask_network_errors: int = 0
+    mask_contract_errors: int = 0
+    mask_achieved_completion_rps: float = 0.0
+    mask_p50: float = 0.0
+    mask_p95: float = 0.0
+    mask_p99: float = 0.0
+    mask_max: float = 0.0
+    # demask phase
+    demask_logical_scheduled: int = 0
+    demask_logical_started: int = 0
+    demask_logical_completed: int = 0
+    demask_http_attempts: int = 0
+    demask_success: int = 0
+    demask_final_429: int = 0
+    demask_final_5xx: int = 0
+    demask_network_errors: int = 0
+    demask_contract_errors: int = 0
+    demask_p50: float = 0.0
+    demask_p95: float = 0.0
+    demask_p99: float = 0.0
+    demask_max: float = 0.0
+    demask_mismatches: int = 0
+    # totals
+    http_attempts: int = 0
+    success: int = 0
+    final_429: int = 0
+    final_5xx: int = 0
+    network_errors: int = 0
+    contract_errors: int = 0
+    max_consecutive_5xx: int = 0
+    max_consecutive_invalid: int = 0
+    consecutive_invalid: int = 0
+    # legacy aliases (mask phase)
     scheduled: int = 0
     started: int = 0
     completed: int = 0
     scheduling_rps: float = 0.0
     completion_rps: float = 0.0
-    success: int = 0
     retried_requests: int = 0
-    final_429: int = 0
     final_4xx: int = 0
-    final_5xx: int = 0
-    network_errors: int = 0
-    contract_errors: int = 0
-    max_consecutive_invalid: int = 0
-    consecutive_invalid: int = 0
-    mask_p50: float = 0.0
-    mask_p95: float = 0.0
-    mask_p99: float = 0.0
-    mask_max: float = 0.0
-    demask_p50: float = 0.0
-    demask_p95: float = 0.0
-    demask_p99: float = 0.0
-    demask_max: float = 0.0
     fraction_latency_gt_1s: float = 0.0
-    demask_mismatches: int = 0
     elapsed_seconds: float = 0.0
     peak_in_flight: int = 0
     reasons: list[str] = field(default_factory=list)
@@ -209,11 +234,14 @@ def failure_reasons(report: LoadReport, *, strict: bool) -> list[str]:
         reasons.append(f"max consecutive invalid >= {INVALID_STREAK_LIMIT}")
     if strict:
         expected = report.target_rps * report.duration
-        if report.scheduled < 0.95 * expected:
-            reasons.append(f"scheduled mask requests {report.scheduled} < 95% of rps*duration ({expected:.0f})")
-        if report.completion_rps < 0.95 * report.target_rps:
+        if report.mask_logical_completed < 0.95 * expected:
             reasons.append(
-                f"achieved completion RPS {report.completion_rps:.2f} < 95% of target {report.target_rps:.2f}"
+                f"mask logical completed {report.mask_logical_completed} < 95% of rps*duration ({expected:.0f})"
+            )
+        if report.mask_achieved_completion_rps < 0.95 * report.target_rps:
+            reasons.append(
+                f"mask achieved completion RPS {report.mask_achieved_completion_rps:.2f} "
+                f"< 95% of target {report.target_rps:.2f}"
             )
         if report.mask_p95 > 1.0:
             reasons.append(f"mask p95 {report.mask_p95:.4f}s > 1s")
@@ -226,6 +254,8 @@ def failure_reasons(report: LoadReport, *, strict: bool) -> list[str]:
 class _RunState:
     consecutive_invalid: int = 0
     max_consecutive_invalid: int = 0
+    consecutive_5xx: int = 0
+    max_consecutive_5xx: int = 0
     stop: bool = False
     in_flight: int = 0
     peak_in_flight: int = 0
@@ -234,11 +264,15 @@ class _RunState:
 def _note_final(state: _RunState, kind: str) -> None:
     if kind == "success":
         state.consecutive_invalid = 0
+        state.consecutive_5xx = 0
         return
     if kind == "rate_limited":
         return
     state.consecutive_invalid += 1
     state.max_consecutive_invalid = max(state.max_consecutive_invalid, state.consecutive_invalid)
+    if kind == "server_error":
+        state.consecutive_5xx += 1
+        state.max_consecutive_5xx = max(state.max_consecutive_5xx, state.consecutive_5xx)
     if state.consecutive_invalid >= INVALID_STREAK_LIMIT:
         state.stop = True
 
@@ -268,7 +302,7 @@ def _classify(response: httpx.Response) -> Outcome:
     if 400 <= status < 500:
         return Outcome(kind="invalid", status=status)
     if status >= 500:
-        return Outcome(kind="invalid", status=status)
+        return Outcome(kind="server_error", status=status)
     return Outcome(kind="invalid", status=status)
 
 
@@ -375,7 +409,7 @@ async def _execute(
         tasks: list[asyncio.Task[tuple[Outcome, float, str, str]]] = []
 
         async def launch(index: int) -> tuple[Outcome, float, str, str]:
-            report.started += 1
+            report.mask_logical_started += 1
             payload = SYNTHETIC_PAYLOADS[index % len(SYNTHETIC_PAYLOADS)]
             payload_id = uuid.uuid4().hex
             outcome, latency = await _occupy(
@@ -402,26 +436,27 @@ async def _execute(
             if state.stop:
                 semaphore.release()
                 break
-            report.scheduled += 1
+            report.mask_logical_scheduled += 1
             tasks.append(asyncio.create_task(launch(index)))
 
         schedule_elapsed = max(clock.monotonic() - phase_started, 0.0)
         results = await asyncio.gather(*tasks) if tasks else []
         mask_completed = len(results)
         mask_elapsed = max(clock.monotonic() - phase_started, 1e-9)
-        report.scheduling_rps = report.scheduled / max(schedule_elapsed, 1e-9)
-        report.completed = mask_completed
-        report.completion_rps = mask_completed / mask_elapsed
+        report.scheduling_rps = report.mask_logical_scheduled / max(schedule_elapsed, 1e-9)
+        report.mask_logical_completed = mask_completed
+        report.mask_achieved_completion_rps = mask_completed / mask_elapsed
 
         for outcome, latency, payload_id, payload in results:
+            report.mask_http_attempts += outcome.attempts
             if outcome.attempts > 1:
                 report.retried_requests += 1
             if outcome.kind == "success" and outcome.body is not None:
-                report.success += 1
+                report.mask_success += 1
                 mask_latencies.append(latency)
                 saved.append((payload_id, outcome.body, payload))
             else:
-                _count_failure(report, outcome)
+                _count_failure(report, outcome, phase="mask")
                 if outcome.attempts:
                     mask_latencies.append(latency)
 
@@ -440,6 +475,7 @@ async def _execute(
         report.elapsed_seconds = max(clock.monotonic() - phase_started, 0.0)
         report.max_consecutive_invalid = state.max_consecutive_invalid
         report.consecutive_invalid = state.consecutive_invalid
+        report.max_consecutive_5xx = state.max_consecutive_5xx
         report.peak_in_flight = state.peak_in_flight
         report.mask_p50 = percentile(mask_latencies, 50)
         report.mask_p95 = percentile(mask_latencies, 95)
@@ -452,22 +488,50 @@ async def _execute(
         if mask_latencies:
             report.fraction_latency_gt_1s = sum(item > 1.0 for item in mask_latencies) / len(mask_latencies)
 
+        # legacy aliases
+        report.scheduled = report.mask_logical_scheduled
+        report.started = report.mask_logical_started
+        report.completed = report.mask_logical_completed
+        report.completion_rps = report.mask_achieved_completion_rps
+        report.success = report.mask_success
+        report.final_429 = report.mask_final_429 + report.demask_final_429
+        report.final_5xx = report.mask_final_5xx + report.demask_final_5xx
+        report.network_errors = report.mask_network_errors + report.demask_network_errors
+        report.contract_errors = report.mask_contract_errors + report.demask_contract_errors
+        report.http_attempts = report.mask_http_attempts + report.demask_http_attempts
 
-def _count_failure(report: LoadReport, outcome: Outcome) -> None:
+
+def _count_failure(report: LoadReport, outcome: Outcome, *, phase: str) -> None:
+    if phase == "mask":
+        if outcome.kind == "rate_limited":
+            report.mask_final_429 += 1
+            return
+        if outcome.status == 0 and outcome.attempts:
+            report.mask_network_errors += 1
+            return
+        if outcome.status == 200:
+            report.mask_contract_errors += 1
+            return
+        if 400 <= outcome.status < 500:
+            report.final_4xx += 1
+            return
+        if outcome.status >= 500 or outcome.status == 0:
+            report.mask_final_5xx += 1
+        return
     if outcome.kind == "rate_limited":
-        report.final_429 += 1
+        report.demask_final_429 += 1
         return
     if outcome.status == 0 and outcome.attempts:
-        report.network_errors += 1
+        report.demask_network_errors += 1
         return
     if outcome.status == 200:
-        report.contract_errors += 1
+        report.demask_contract_errors += 1
         return
     if 400 <= outcome.status < 500:
         report.final_4xx += 1
         return
     if outcome.status >= 500 or outcome.status == 0:
-        report.final_5xx += 1
+        report.demask_final_5xx += 1
 
 
 async def _demask_phase(
@@ -486,6 +550,7 @@ async def _demask_phase(
 
     async def one(payload_id: str, masked: str, original: str) -> None:
         nonlocal mismatches
+        report.demask_logical_started += 1
         outcome, latency = await _occupy(
             client,
             clock,
@@ -495,13 +560,17 @@ async def _demask_phase(
             payload_id,
             config.timeout,
         )
+        report.demask_logical_completed += 1
+        report.demask_http_attempts += outcome.attempts
         latencies.append(latency)
         if outcome.attempts > 1:
             report.retried_requests += 1
         if outcome.kind != "success" or outcome.body != original:
             if outcome.kind != "success":
-                _count_failure(report, outcome)
+                _count_failure(report, outcome, phase="demask")
             mismatches += 1
+        else:
+            report.demask_success += 1
 
     for payload_id, masked, original in saved:
         if state.stop:
@@ -510,6 +579,7 @@ async def _demask_phase(
         if state.stop:
             semaphore.release()
             break
+        report.demask_logical_scheduled += 1
         tasks.append(asyncio.create_task(one(payload_id, masked, original)))
     if tasks:
         await asyncio.gather(*tasks)
@@ -519,31 +589,50 @@ async def _demask_phase(
 def print_report(report: LoadReport) -> None:
     print(f"target_rps: {report.target_rps}")
     print(f"duration: {report.duration}")
-    print(f"scheduled_requests: {report.scheduled}")
-    print(f"started_requests: {report.started}")
-    print(f"completed_requests: {report.completed}")
-    print(f"achieved_scheduling_rps: {report.scheduling_rps:.2f}")
-    print(f"achieved_completion_rps: {report.completion_rps:.2f}")
-    print(f"success: {report.success}")
-    print(f"retried_requests: {report.retried_requests}")
-    print(f"final_429: {report.final_429}")
-    print(f"final_4xx: {report.final_4xx}")
-    print(f"final_5xx: {report.final_5xx}")
-    print(f"network_errors: {report.network_errors}")
-    print(f"contract_errors: {report.contract_errors}")
-    print(f"max_consecutive_invalid: {report.max_consecutive_invalid}")
-    print(f"mask_latency_p50: {report.mask_p50:.4f}")
-    print(f"mask_latency_p95: {report.mask_p95:.4f}")
-    print(f"mask_latency_p99: {report.mask_p99:.4f}")
-    print(f"mask_latency_max: {report.mask_max:.4f}")
-    print(f"demask_latency_p50: {report.demask_p50:.4f}")
-    print(f"demask_latency_p95: {report.demask_p95:.4f}")
-    print(f"demask_latency_p99: {report.demask_p99:.4f}")
-    print(f"demask_latency_max: {report.demask_max:.4f}")
-    print(f"fraction_latency_gt_1s: {report.fraction_latency_gt_1s:.4f}")
-    print(f"demask_mismatches: {report.demask_mismatches}")
-    print(f"elapsed_seconds: {report.elapsed_seconds:.4f}")
-    print(f"peak_in_flight: {report.peak_in_flight}")
+    print(f"strict: {str(report.strict).lower()}")
+    print("mask_phase:")
+    print(f"  logical_scheduled: {report.mask_logical_scheduled}")
+    print(f"  logical_started: {report.mask_logical_started}")
+    print(f"  logical_completed: {report.mask_logical_completed}")
+    print(f"  http_attempts: {report.mask_http_attempts}")
+    print(f"  success: {report.mask_success}")
+    print(f"  final_429: {report.mask_final_429}")
+    print(f"  final_5xx: {report.mask_final_5xx}")
+    print(f"  network_errors: {report.mask_network_errors}")
+    print(f"  contract_errors: {report.mask_contract_errors}")
+    print(f"  achieved_completion_rps: {report.mask_achieved_completion_rps:.2f}")
+    print(f"  latency_p50: {report.mask_p50:.4f}")
+    print(f"  latency_p95: {report.mask_p95:.4f}")
+    print(f"  latency_p99: {report.mask_p99:.4f}")
+    print(f"  latency_max: {report.mask_max:.4f}")
+    print("demask_phase:")
+    print(f"  logical_scheduled: {report.demask_logical_scheduled}")
+    print(f"  logical_started: {report.demask_logical_started}")
+    print(f"  logical_completed: {report.demask_logical_completed}")
+    print(f"  http_attempts: {report.demask_http_attempts}")
+    print(f"  success: {report.demask_success}")
+    print(f"  final_429: {report.demask_final_429}")
+    print(f"  final_5xx: {report.demask_final_5xx}")
+    print(f"  network_errors: {report.demask_network_errors}")
+    print(f"  contract_errors: {report.demask_contract_errors}")
+    print(f"  latency_p50: {report.demask_p50:.4f}")
+    print(f"  latency_p95: {report.demask_p95:.4f}")
+    print(f"  latency_p99: {report.demask_p99:.4f}")
+    print(f"  latency_max: {report.demask_max:.4f}")
+    print(f"  mismatches: {report.demask_mismatches}")
+    print("totals:")
+    print(f"  http_attempts: {report.http_attempts}")
+    print(f"  success: {report.success}")
+    print(f"  final_429: {report.final_429}")
+    print(f"  final_5xx: {report.final_5xx}")
+    print(f"  network_errors: {report.network_errors}")
+    print(f"  contract_errors: {report.contract_errors}")
+    print(f"  max_consecutive_5xx: {report.max_consecutive_5xx}")
+    print(f"  max_consecutive_invalid: {report.max_consecutive_invalid}")
+    print(f"  consecutive_invalid: {report.consecutive_invalid}")
+    print(f"  retried_requests: {report.retried_requests}")
+    print(f"  peak_in_flight: {report.peak_in_flight}")
+    print(f"  elapsed_seconds: {report.elapsed_seconds:.4f}")
     for reason in report.reasons:
         print(f"fail_reason: {reason}")
     print(f"result: {'PASS' if report.passed else 'FAIL'}")

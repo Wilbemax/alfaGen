@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import hashlib
 import itertools
 import json
 import sys
@@ -20,6 +21,11 @@ from pathlib import Path
 from typing import Any
 
 import httpx
+
+if __name__ == "__main__":
+    sys.path.insert(0, str(Path(__file__).parent.parent))
+
+DATASET_SHA256 = "5ff155151f20e040b2cc8f6d5330516df170bc5078697edafe354f0dd1e848a6"
 
 REQUIRED_ENTITY_TYPES: frozenset[str] = frozenset(
     {
@@ -88,12 +94,15 @@ class TypeScore:
 
     @property
     def f1(self) -> float:
-        return _f1(self.precision, self.recall)
+        return _calculate_f1(self.tp, self.fp, self.fn)
 
 
 @dataclass(slots=True)
 class BenchmarkMetrics:
     case_count: int
+    positive_cases: int
+    negative_cases: int
+    gold_entity_count: int
     micro: TypeScore
     macro_precision: float
     macro_recall: float
@@ -102,7 +111,6 @@ class BenchmarkMetrics:
     invalid_spans: int
     invariant_violations: int
     negative_fp_rate: float
-    negative_cases: int
     negative_fp_cases: int
     exact_mask_match_rate: float
     mean_mask_similarity: float
@@ -112,16 +120,27 @@ class BenchmarkMetrics:
 
 
 def _ratio(numerator: int, denominator: int) -> float:
-    """Пустой знаменатель — 1.0: отсутствие решений не считается ошибкой деления."""
+    """Precision/Recall: пустой знаменатель — 0.0 (нет решений — нет метрики)."""
     if denominator == 0:
-        return 1.0
+        return 0.0
     return numerator / denominator
 
 
-def _f1(precision: float, recall: float) -> float:
+def _calculate_f1(tp: int, fp: int, fn: int) -> float:
+    """Строгая математика F1 из сырых TP/FP/FN.
+
+    Precision = tp / (tp + fp) if (tp + fp) > 0 else 0.0
+    Recall    = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+    F1        = 2 * P * R / (P + R) if (P + R) > 0 else 0.0
+
+    Для TP=0, FP>0, FN>0 результат строго 0.0. Никаких special cases,
+    возвращающих 1.0 при наличии FP или FN.
+    """
+    precision = _ratio(tp, tp + fp)
+    recall = _ratio(tp, tp + fn)
     total = precision + recall
     if total == 0.0:
-        return 1.0
+        return 0.0
     return 2.0 * precision * recall / total
 
 
@@ -255,6 +274,16 @@ def dataset_type_counts(cases: list[Case]) -> dict[str, int]:
     return counts
 
 
+def verify_dataset_hash(path: Path, expected: str | None = None) -> None:
+    """Проверяет SHA-256 хэш датасета и падает с понятной ошибкой при несовпадении."""
+    expected = expected or DATASET_SHA256
+    digest = hashlib.sha256(path.read_bytes()).hexdigest()
+    if digest != expected:
+        raise ValueError(
+            f"dataset hash mismatch for {path}: expected {expected}, got {digest}"
+        )
+
+
 def load_dataset(path: Path) -> list[Case]:
     cases: list[Case] = []
     raw = path.read_text(encoding="utf-8")
@@ -299,8 +328,10 @@ def summarize(cases: list[Case], predictions: list[Prediction], *, http_mode: bo
     exact_matches = 0
     similarity_total = 0.0
     demask_hits = 0
+    positive_cases = 0
     negative_cases = 0
     negative_fp_cases = 0
+    gold_entity_count = 0
 
     for case, prediction in zip(cases, predictions, strict=True):
         scored = score_keys(entity_keys(case.gold_entities), set(prediction.entities))
@@ -316,6 +347,9 @@ def summarize(cases: list[Case], predictions: list[Prediction], *, http_mode: bo
         similarity_total += normalized_mask_similarity(prediction.mask, case.gold_mask)
         if prediction.demask_exact:
             demask_hits += 1
+        if case.gold_entities:
+            positive_cases += 1
+            gold_entity_count += len(case.gold_entities)
         if "negative" in case.tags:
             negative_cases += 1
             if prediction.entities:
@@ -332,6 +366,9 @@ def summarize(cases: list[Case], predictions: list[Prediction], *, http_mode: bo
         notes.append("mask similarity is in-process; demask exact rate is Masker round-trip")
     return BenchmarkMetrics(
         case_count=case_count,
+        positive_cases=positive_cases,
+        negative_cases=negative_cases,
+        gold_entity_count=gold_entity_count,
         micro=micro_score(per_type),
         macro_precision=macro_precision,
         macro_recall=macro_recall,
@@ -340,7 +377,6 @@ def summarize(cases: list[Case], predictions: list[Prediction], *, http_mode: bo
         invalid_spans=invalid_spans,
         invariant_violations=invariant_violations,
         negative_fp_rate=_ratio(negative_fp_cases, negative_cases) if negative_cases else 0.0,
-        negative_cases=negative_cases,
         negative_fp_cases=negative_fp_cases,
         exact_mask_match_rate=_ratio(exact_matches, case_count) if case_count else 1.0,
         mean_mask_similarity=(similarity_total / case_count) if case_count else 1.0,
@@ -480,7 +516,10 @@ def gate_failures(metrics: BenchmarkMetrics, args: argparse.Namespace) -> list[s
 
 
 def print_report(metrics: BenchmarkMetrics) -> None:
-    print(f"cases: {metrics.case_count}")
+    print(f"samples: {metrics.case_count}")
+    print(f"positive_samples: {metrics.positive_cases}")
+    print(f"negative_samples: {metrics.negative_cases}")
+    print(f"gold_entity_count: {metrics.gold_entity_count}")
     print(f"http_mode: {str(metrics.http_mode).lower()}")
     print(
         "micro: "
@@ -495,6 +534,10 @@ def print_report(metrics: BenchmarkMetrics) -> None:
     print(f"invalid_spans: {metrics.invalid_spans}")
     print(f"invariant_violations: {metrics.invariant_violations}")
     print(
+        "negative_false_positive_count: "
+        f"{metrics.negative_fp_cases}"
+    )
+    print(
         "negative_false_positive_rate: "
         f"{metrics.negative_fp_rate:.4f} "
         f"({metrics.negative_fp_cases}/{metrics.negative_cases})"
@@ -506,6 +549,7 @@ def print_report(metrics: BenchmarkMetrics) -> None:
             f"{entity_type:<22} {score.tp:6d} {score.fp:6d} {score.fn:6d} "
             f"{score.precision:10.4f} {score.recall:10.4f} {score.f1:10.4f}"
         )
+    print("WARNING: Span/type metrics are calculated in-process. HTTP mode only validates exact mask/demask strings.")
     for note in metrics.notes:
         print(f"note: {note}")
 
@@ -528,6 +572,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
     try:
+        verify_dataset_hash(args.dataset)
         cases = load_dataset(args.dataset)
     except (OSError, json.JSONDecodeError, ValueError, KeyError, TypeError) as exc:
         print(f"dataset_error: {exc}", file=sys.stderr)
