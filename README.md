@@ -117,14 +117,47 @@ Prometheus метрики: latency, RPS, tokens per second, счётчик су�
 
 ## Конфигурация
 
-- `app/config/settings.yaml` — основные настройки
-- `app/config/pii_rules.yaml` — правила ПДн для разных `system_id`
-- `.env` — секреты и переменные окружения (см. `.env.example`)
+Активные runtime-настройки читаются из переменных окружения и файла `.env` (см. `.env.example`). Правила ПДн читаются из YAML `app/config/pii_rules.yaml`. Файл `app/config/settings.yaml` кодом приложения не читается.
 
 ## Тесты
 
 ```bash
 pytest
+```
+
+## Quality benchmark
+
+Независимый датасет `benchmarks/pii_quality.jsonl` — синтетические случаи, не копия unit-тестов. Скрипт считает exact-span TP/FP/FN, micro/macro Precision/Recall/F1, exact mask match, долю ложных срабатываний на negative-кейсах, число битых спанов и нарушений `text == source[start:end]`.
+
+`mean_mask_similarity_proxy` — это `1 - levenshtein(predicted_mask, gold_mask) / max(len)`. Это proxy: PDF проверки не раскрывает точную формулу span-based Levenshtein и способ агрегации порога 95%.
+
+In-process режим сравнивает `CascadeDetector` и `Masker` с gold-спанами. С `--base-url` маска и точное восстановление исходника измеряются двумя вызовами `POST /process` с одним `payload_id`.
+
+```bash
+python scripts/quality_benchmark.py \
+  --dataset benchmarks/pii_quality.jsonl \
+  --min-mask-similarity 0.95 \
+  --min-micro-f1 0.95 \
+  --min-macro-f1 0.90 \
+  --max-negative-fp 0.05 \
+  --min-demask-exact 1.0
+```
+
+Порог 95% подтверждается только напечатанным отчётом этого прогона. Датасет намеренно не подгоняется под текущие детекторы.
+
+## Нагрузочная проверка
+
+`scripts/load_check.py` планирует маскирование open-loop с целевым RPS, одним HTTP-клиентом и ограничением in-flight. Затем отдельно демаскирует только успешные `payload_id`. До двух retry, `Retry-After` для 429, остановка после пяти невалидных ответов подряд. 429 не двигает счётчик невалидных ответов.
+
+PASS с флагом `--strict` требует фактический completed RPS и p95 latency, ноль расхождений демаскирования, ноль финальных 429/5xx и валидный JSON `{result}`. Цифра 1000 RPS считается достигнутой только если конкретный strict-отчёт это показал. Прогон на 2000 RPS в обязательный gate не входит.
+
+```bash
+python scripts/load_check.py \
+  --base-url http://127.0.0.1:8000 \
+  --rps 1000 \
+  --duration 30 \
+  --concurrency 2000 \
+  --strict
 ```
 
 ## Безопасность
