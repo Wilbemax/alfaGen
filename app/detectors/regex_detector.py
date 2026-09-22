@@ -39,6 +39,13 @@ class RegexDetector(BaseDetector):
     _DRIVER_VALUE = re.compile(
         r"(?<!\d)(?:\d{2}\s\d{2}\s\d{6}|\d{4}\s\d{6}|\d{2}\s\d{6})(?!\d)"
     )
+    _CITIZENSHIP_VALUE = re.compile(
+        r"(?iu)(?<![а-яёa-z])(?:рф|российск(?:ая|ой|ую)\s+"
+        r"федерац(?:ия|ии|ию))(?![а-яёa-z])"
+    )
+    _CARD_HOLDER_VALUE = re.compile(
+        r"(?<![A-Za-z])[A-Z]+[ \t]+[A-Z]+(?![A-Za-z])"
+    )
 
     _TYPE_SPECIFICITY: ClassVar[dict[str, int]] = {
         "BANK_CARD": 120,
@@ -50,6 +57,8 @@ class RegexDetector(BaseDetector):
         "EMAIL": 85,
         "PHONE": 85,
         "INN": 80,
+        "CITIZENSHIP": 80,
+        "CARD_HOLDER": 80,
         "PASSPORT_ISSUE_DATE": 75,
         "DATE_OF_BIRTH": 70,
     }
@@ -70,6 +79,8 @@ class RegexDetector(BaseDetector):
             "DRIVER_LICENSE",
             "DATE_OF_BIRTH",
             "PASSPORT_ISSUE_DATE",
+            "CITIZENSHIP",
+            "CARD_HOLDER",
         }
 
     async def initialize(self) -> None:
@@ -146,6 +157,7 @@ class RegexDetector(BaseDetector):
         matches = self._detect_regular_patterns(text)
         matches.extend(self._detect_documents(text))
         matches.extend(self._detect_dates(text))
+        matches.extend(self._detect_contextual_values(text))
 
         enabled = [match for match in matches if self._is_enabled(match.entity_type)]
         deduplicated = list(
@@ -229,6 +241,31 @@ class RegexDetector(BaseDetector):
                 found.append(
                     self._make_match(entity_type, text, start, end, 0.92)
                 )
+        return found
+
+    def _detect_contextual_values(self, text: str) -> list[PIIMatch]:
+        found: list[PIIMatch] = []
+        contextual_patterns = (
+            (
+                "CITIZENSHIP",
+                self._CITIZENSHIP_VALUE,
+                ("гражданство", "гражданин"),
+                0.95,
+            ),
+            (
+                "CARD_HOLDER",
+                self._CARD_HOLDER_VALUE,
+                ("держатель", "cardholder", "holder"),
+                0.95,
+            ),
+        )
+        for entity_type, pattern, keywords, confidence in contextual_patterns:
+            for match in pattern.finditer(text):
+                start, end = match.span()
+                if self._has_context(text, start, end, keywords):
+                    found.append(
+                        self._make_match(entity_type, text, start, end, confidence)
+                    )
         return found
 
     def _make_match(

@@ -33,6 +33,11 @@ _ISSUER_PREFIX = re.compile(r"(?iu)(?:выдан|выдано)\s+")
 _PLACE_LEFT = re.compile(
     r"(?iu)(?:городе|город|г\.|улица|ул\.?|проспект)\s+$"
 )
+_ADDRESS_SERVICE_PREFIX = re.compile(r"(?iu)\bпроживает\b[ \t]*:[ \t]*")
+_STRUCTURED_ADDRESS_COMPONENT = re.compile(
+    r"(?iu)^(?:\d{6}|(?:г\.?|город|ул\.?|улица|проспект|д\.?|дом|кв\.?|индекс)"
+    r"(?:\s|$))"
+)
 
 
 class NatashaDetector(BaseDetector):
@@ -128,8 +133,13 @@ class NatashaDetector(BaseDetector):
                 continue
             matches.append(mapped)
 
-        matches.sort(key=lambda item: (item.start, item.end))
-        return matches
+        if deadline_monotonic is not None and time.monotonic() >= deadline_monotonic:
+            return []
+        expanded = _expand_address_matches(text, matches, covered, self.name)
+        deduplicated = {
+            (match.entity_type, match.start, match.end): match for match in expanded
+        }
+        return sorted(deduplicated.values(), key=lambda item: (item.start, item.end))
 
     def _load_models(self) -> None:
         doc_cls, segmenter, tagger = _load_natasha_models()
@@ -245,6 +255,119 @@ def _expand_place_left(text: str, start: int) -> int:
     if matched is None:
         return start
     return start - len(matched.group())
+
+
+def _expand_address_matches(
+    text: str,
+    matches: list[PIIMatch],
+    covered: list[tuple[int, int]],
+    detector_name: str,
+) -> list[PIIMatch]:
+    expanded: list[PIIMatch] = []
+    for match in matches:
+        if match.entity_type != "ADDRESS":
+            expanded.append(match)
+            continue
+        start, end = _structured_address_bounds(text, match.start, match.end)
+        for safe_start, safe_end in _subtract_occupied(start, end, covered):
+            expanded.append(
+                PIIMatch(
+                    entity_type="ADDRESS",
+                    text=text[safe_start:safe_end],
+                    start=safe_start,
+                    end=safe_end,
+                    confidence=match.confidence,
+                    detector_name=detector_name,
+                )
+            )
+    return expanded
+
+
+def _structured_address_bounds(
+    text: str,
+    address_start: int,
+    address_end: int,
+) -> tuple[int, int]:
+    section_start = max(
+        text.rfind(";", 0, address_start),
+        text.rfind("\n", 0, address_start),
+        text.rfind("\r", 0, address_start),
+    ) + 1
+    section_end = len(text)
+    for separator in (";", "\n", "\r"):
+        position = text.find(separator, address_end)
+        if position != -1:
+            section_end = min(section_end, position)
+
+    components: list[tuple[int, int, str]] = []
+    for component in re.finditer(r"[^,]+", text[section_start:section_end]):
+        start = section_start + component.start()
+        end = section_start + component.end()
+        while start < end and text[start].isspace():
+            start += 1
+        while end > start and text[end - 1].isspace():
+            end -= 1
+        if start < end:
+            components.append((start, end, text[start:end]))
+
+    anchor = next(
+        (
+            index
+            for index, (start, end, _) in enumerate(components)
+            if address_start < end and address_end > start
+        ),
+        None,
+    )
+    if anchor is None:
+        return address_start, address_end
+    if not _is_address_component(components[anchor]):
+        return address_start, address_end
+
+    left = anchor
+    while left > 0 and _is_address_component(components[left - 1]):
+        left -= 1
+    right = anchor
+    while right + 1 < len(components) and _is_address_component(components[right + 1]):
+        right += 1
+
+    start, _, first_text = components[left]
+    prefix = _ADDRESS_SERVICE_PREFIX.search(first_text)
+    if prefix is not None:
+        start += prefix.end()
+    end = components[right][1]
+    if start >= end:
+        return address_start, address_end
+    return start, end
+
+
+def _is_address_component(component: tuple[int, int, str]) -> bool:
+    _, _, value = component
+    return (
+        _ADDRESS_SERVICE_PREFIX.search(value) is not None
+        or _STRUCTURED_ADDRESS_COMPONENT.search(value) is not None
+    )
+
+
+def _subtract_occupied(
+    start: int,
+    end: int,
+    covered: list[tuple[int, int]],
+) -> list[tuple[int, int]]:
+    safe: list[tuple[int, int]] = []
+    cursor = start
+    for occupied_start, occupied_end in covered:
+        if occupied_end <= cursor:
+            continue
+        if occupied_start >= end:
+            break
+        if cursor < occupied_start:
+            safe.append((cursor, min(occupied_start, end)))
+        cursor = max(cursor, occupied_end)
+        if cursor >= end:
+            break
+    if cursor < end:
+        safe.append((cursor, end))
+    return [(part_start, part_end) for part_start, part_end in safe if part_start < part_end]
 
 
 def _extend_issuer(text: str, start: int, end: int) -> int:

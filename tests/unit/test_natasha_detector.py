@@ -279,6 +279,82 @@ async def test_address_location_uses_context_and_exact_offsets() -> None:
 
 
 @pytest.mark.asyncio
+async def test_structured_address_expands_from_location() -> None:
+    text = "проживает: Москва, 125009, г. Москва, ул. Тверская, д. 15, кв. 45"
+    address = "Москва, 125009, г. Москва, ул. Тверская, д. 15, кв. 45"
+    location = "Москва"
+    start = text.index(location)
+    detector = NatashaDetector(
+        ner_runner=_runner([(start, start + len(location), "LOC", 0.9)])
+    )
+    await detector.initialize()
+
+    matches = await detector.detect(text)
+    addresses = [match for match in matches if match.entity_type == "ADDRESS"]
+
+    assert addresses
+    assert all(match.text == text[match.start:match.end] for match in addresses)
+    covered = {
+        index
+        for match in addresses
+        for index in range(match.start, match.end)
+    }
+    expected_start = text.index(address)
+    assert covered == set(range(expected_start, len(text)))
+    assert all(match.start >= expected_start for match in addresses)
+
+
+@pytest.mark.asyncio
+async def test_structured_address_does_not_overlap_occupied() -> None:
+    text = "проживает: Москва, 125009, г. Москва, ул. Тверская, д. 15, кв. 45"
+    location = "Москва"
+    location_start = text.index(location)
+    occupied_start = text.index("125009")
+    occupied = (occupied_start, occupied_start + len("125009"))
+    detector = NatashaDetector(
+        ner_runner=_runner(
+            [(location_start, location_start + len(location), "LOC", 0.9)]
+        )
+    )
+    await detector.initialize()
+
+    matches = await detector.detect(text, occupied=[occupied])
+    addresses = [match for match in matches if match.entity_type == "ADDRESS"]
+
+    assert addresses
+    assert all(match.text == text[match.start:match.end] for match in addresses)
+    assert all(
+        match.end <= occupied[0] or match.start >= occupied[1]
+        for match in addresses
+    )
+    covered = {
+        index
+        for match in addresses
+        for index in range(match.start, match.end)
+    }
+    covered.update(range(*occupied))
+    assert covered == set(range(text.index(location), len(text)))
+
+
+@pytest.mark.asyncio
+async def test_location_inside_issuer_is_not_expanded_to_whole_phrase() -> None:
+    text = "выдан ОУФМС России по г. Москве"
+    location = "Москве"
+    start = text.index(location)
+    detector = NatashaDetector(
+        ner_runner=_runner([(start, start + len(location), "LOC", 0.9)])
+    )
+    await detector.initialize()
+
+    matches = await detector.detect(text)
+
+    assert len(matches) == 1
+    assert matches[0].entity_type == "ADDRESS"
+    assert matches[0].text == "г. Москве"
+    assert matches[0].text == text[matches[0].start:matches[0].end]
+
+
+@pytest.mark.asyncio
 async def test_organization_without_issuer_context_is_dropped() -> None:
     text = "Компания Ромашка"
     detector = NatashaDetector(

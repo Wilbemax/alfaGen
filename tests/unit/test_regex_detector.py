@@ -170,6 +170,76 @@ async def test_citizenship_not_person(regex_detector):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("source", "expected"),
+    [
+        ("Гражданство: РФ", "РФ"),
+        ("гражданство Российской Федерации", "Российской Федерации"),
+    ],
+)
+async def test_detect_citizenship_value_only(regex_detector, source, expected):
+    matches = await regex_detector.detect(source)
+    citizenship = [m for m in matches if m.entity_type == "CITIZENSHIP"]
+
+    assert len(citizenship) == 1
+    match = citizenship[0]
+    assert match.text == expected
+    assert source[match.start:match.end] == match.text
+    assert match.start == source.index(expected)
+    assert match.end == match.start + len(expected)
+
+
+@pytest.mark.asyncio
+async def test_citizenship_requires_explicit_context(regex_detector):
+    source = "Договор действует на территории РФ"
+    matches = await regex_detector.detect(source)
+
+    assert not any(m.entity_type == "CITIZENSHIP" for m in matches)
+
+
+@pytest.mark.asyncio
+async def test_citizen_keyword_is_supported(regex_detector):
+    source = "Гражданин РФ"
+    matches = await regex_detector.detect(source)
+    citizenship = next(m for m in matches if m.entity_type == "CITIZENSHIP")
+
+    assert citizenship.text == "РФ"
+    assert source[citizenship.start:citizenship.end] == citizenship.text
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("marker", ["Держатель карты:", "cardholder", "holder"])
+async def test_detect_card_holder_value_only(regex_detector, marker):
+    source = f"{marker} IVAN IVANOV"
+    matches = await regex_detector.detect(source)
+    holders = [m for m in matches if m.entity_type == "CARD_HOLDER"]
+
+    assert len(holders) == 1
+    match = holders[0]
+    assert match.text == "IVAN IVANOV"
+    assert source[match.start:match.end] == match.text
+    assert match.start == source.index("IVAN IVANOV")
+    assert match.end == match.start + len("IVAN IVANOV")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "source",
+    [
+        "NEW YORK is a city",
+        "ALPHA BETA указаны в отчёте",
+    ],
+)
+async def test_uppercase_pair_without_holder_context_is_not_detected(
+    regex_detector,
+    source,
+):
+    matches = await regex_detector.detect(source)
+
+    assert not any(m.entity_type == "CARD_HOLDER" for m in matches)
+
+
+@pytest.mark.asyncio
 async def test_cvv_span_is_value_only(regex_detector):
     matches = await regex_detector.detect("CVV: 123")
     cvv = next(m for m in matches if m.entity_type == "CARD_CVV")
