@@ -5,10 +5,12 @@ import time
 from contextlib import asynccontextmanager
 from typing import TYPE_CHECKING
 
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.responses import JSONResponse
 from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
 
+from app.config.settings import pii_rules
+from app.core.payload_store import payload_store
 from app.core.pipeline import PipelineError, pipeline
 from app.middleware.logging_middleware import MetricsMiddleware, RequestLoggingMiddleware
 from app.models.request import (
@@ -73,6 +75,7 @@ async def health() -> HealthResponse:
         checks={
             "pipeline": True,
             "rate_limiter": True,
+            "redis": payload_store.redis_available,
         },
     )
 
@@ -100,6 +103,7 @@ async def metrics() -> Response:
 async def process_request(
     request: ProcessRequest,
     http_request: Request,
+    x_system_id: str | None = Header(default=None, alias="X-System-Id"),
 ) -> ProcessResponse:
     """
     Обрабатывает текст по контракту AlfaSonar.
@@ -109,6 +113,10 @@ async def process_request(
       - второй запрос с тем же payload_id — демаскирование.
     """
     request_id = getattr(http_request.state, "request_id", "unknown")
+
+    # Проверка системы до rate limiting и pipeline.
+    if x_system_id is not None and not pii_rules.is_enabled(x_system_id):
+        return JSONResponse(status_code=403, content={"error": "forbidden"})
 
     # Rate limiting по клиенту (host), чтобы один клиент держал 1000 RPS.
     # 429 с Retry-After отдаётся только при реальной перегрузке.
@@ -126,7 +134,7 @@ async def process_request(
         )
 
     try:
-        result = await pipeline.process(request.payload, request.payload_id)
+        result = await pipeline.process(request.payload, request.payload_id, x_system_id)
         return ProcessResponse(result=result)
 
     except PipelineError:

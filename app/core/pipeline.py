@@ -3,11 +3,12 @@ from __future__ import annotations
 import logging
 import time
 from collections import Counter
+from typing import Any
 
+from app.config.settings import pii_rules
 from app.core.masker import MaskResult, masker
 from app.core.payload_store import PayloadRecord, payload_store
-from app.detectors.base import DetectorConfig
-from app.detectors.regex_detector import RegexDetector
+from app.detectors.cascade import CascadeDetector
 from app.utils.metrics import observe_entities, observe_tokens
 from app.utils.tokenizer import count_tokens
 
@@ -28,36 +29,44 @@ class Pipeline:
       - тот же payload_id и payload == сохранённый исходник — ретрай маскирования,
         возвращает ту же маску без пересчёта;
       - тот же payload_id и payload == сохранённая маска — демаскирование,
-        возвращает исходную строку;
-      - если ПДн нет и маска совпала с исходником, оба шага возвращают эту же строку.
-
-    Горячий путь использует только regex-детектор и не обращается к LLM,
-    не загружает Natasha или Presidio.
+        возвращает исходную строку (если demask_enabled);
+      - чужой текст с известным payload_id — возвращает сохранённую маску,
+        не перезаписывая пару.
     """
 
     def __init__(self) -> None:
-        self.detector = RegexDetector(DetectorConfig(enabled=True, confidence_threshold=0.5))
+        self.cascade = CascadeDetector()
         self._initialized = False
 
     async def initialize(self) -> None:
-        """Инициализация regex-детектора и хранилища."""
+        """Инициализация каскада детекторов и хранилища."""
         if self._initialized:
             return
-        await self.detector.initialize()
+        await self.cascade.initialize()
         await payload_store.initialize()
         self._initialized = True
-        logger.info("Pipeline initialized (regex-only hot path)")
+        logger.info("Pipeline initialized")
 
     async def close(self) -> None:
         """Закрытие ресурсов хранилища."""
         await payload_store.close()
 
-    async def process(self, payload: str, payload_id: str) -> str:
+    def _get_profile(self, system_id: str | None) -> dict[str, Any]:
+        """Профиль системы из pii_rules."""
+        return pii_rules.get_system_profile(system_id)
+
+    async def process(
+        self,
+        payload: str,
+        payload_id: str,
+        system_id: str | None = None,
+    ) -> str:
         """
         Обрабатывает payload по payload_id.
         Возвращает маску (новый id / ретрай) или исходную строку (демаскирование).
         """
         start_time = time.monotonic()
+        profile = self._get_profile(system_id)
 
         if not self._initialized:
             await self.initialize()
@@ -69,12 +78,19 @@ class Pipeline:
                 self._log_entities("process_mask_retry", existing.entity_types, start_time, payload_id)
                 return existing.masked_text
             if payload == existing.masked_text:
-                # Демаскирование: возвращаем исходник
-                self._log_entities("process_unmask", existing.entity_types, start_time, payload_id)
-                return existing.original_text
+                if profile.get("demask_enabled", False):
+                    # Демаскирование: возвращаем исходник
+                    self._log_entities("process_unmask", existing.entity_types, start_time, payload_id)
+                    return existing.original_text
+                # Демаскирование выключено: возвращаем маску
+                self._log_entities("process_mask_retry", existing.entity_types, start_time, payload_id)
+                return existing.masked_text
+            # Чужой текст с известным payload_id: возвращаем сохранённую маску
+            self._log_entities("process_mask_retry", existing.entity_types, start_time, payload_id)
+            return existing.masked_text
 
-        # Новый payload_id или payload не совпал ни с исходником, ни с маской
-        result = await self._mask(payload, payload_id)
+        # Новый payload_id: маскирование
+        result = await self._mask(payload, payload_id, profile)
         self._log_entities("process_mask", result.entity_types, start_time, payload_id)
         return result.masked_text
 
@@ -91,9 +107,17 @@ class Pipeline:
             },
         )
 
-    async def _mask(self, payload: str, payload_id: str) -> MaskResult:
+    async def _mask(self, payload: str, payload_id: str, profile: dict[str, Any]) -> MaskResult:
         """Маскирование: детекция + маска + сохранение соответствия."""
-        entities = await self.detector(payload)
+        allowed_types = profile.get("enabled_entity_types")
+        if isinstance(allowed_types, list):
+            allowed_types = set(allowed_types)
+
+        try:
+            entities = await self.cascade.detect(payload, allowed_types=allowed_types)
+        except Exception:
+            raise PipelineError("detection failed") from None
+
         mask_result = masker.mask(payload, entities)
 
         # Метрики: счётчик сущностей по типам и обработанные токены

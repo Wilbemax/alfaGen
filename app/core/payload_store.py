@@ -6,6 +6,8 @@ import threading
 import time
 from dataclasses import dataclass, field
 
+from cryptography.fernet import Fernet, InvalidToken
+
 from app.config.settings import settings
 
 logger = logging.getLogger(__name__)
@@ -56,6 +58,8 @@ class PayloadStore:
         self._max_entries = max_entries
         self._key_prefix = key_prefix if key_prefix is not None else settings.payload_store_key_prefix
         self._redis = None
+        self.redis_available: bool = False
+        self._fernet: Fernet | None = None
         self._records: dict[str, PayloadRecord] = {}
         self._lock = threading.Lock()
         self._inserts_since_evict = 0
@@ -63,6 +67,21 @@ class PayloadStore:
 
     async def initialize(self) -> None:
         """Инициализация Redis подключения (с fallback на in-memory)."""
+        # Ключ шифрования берём только из settings.payload_store_key.
+        key = settings.payload_store_key
+        if not key:
+            logger.warning("PAYLOAD_STORE_KEY is empty, Redis payload store disabled")
+            self._redis = None
+            self.redis_available = False
+            return
+        try:
+            self._fernet = Fernet(key.encode("utf-8"))
+        except Exception:
+            logger.warning("Invalid PAYLOAD_STORE_KEY, Redis payload store disabled")
+            self._fernet = None
+            self._redis = None
+            self.redis_available = False
+            return
         try:
             import redis.asyncio as aioredis
             self._redis = aioredis.Redis(
@@ -72,26 +91,31 @@ class PayloadStore:
                 password=settings.redis_password,
                 socket_timeout=settings.redis_socket_timeout,
                 socket_connect_timeout=settings.redis_socket_connect_timeout,
-                decode_responses=True,
+                decode_responses=False,
             )
             await self._redis.ping()
+            self.redis_available = True
             logger.info("Payload store initialized with Redis")
         except Exception as e:
             logger.warning(f"Redis unavailable for payload store, using in-memory: {e}")
             self._redis = None
+            self.redis_available = False
 
     async def close(self) -> None:
         if self._redis:
             await self._redis.aclose()
             self._redis = None
+            self.redis_available = False
 
     async def put(self, payload_id: str, record: PayloadRecord) -> None:
         """Сохраняет запись соответствия по payload_id."""
-        if self._redis is not None:
+        if self._redis is not None and self._fernet is not None:
             try:
+                plaintext = json.dumps(record.to_dict(), ensure_ascii=False).encode("utf-8")
+                ciphertext = self._fernet.encrypt(plaintext)
                 await self._redis.set(
                     self._key_prefix + payload_id,
-                    json.dumps(record.to_dict(), ensure_ascii=False),
+                    ciphertext,
                     ex=int(self._ttl),
                 )
             except Exception as e:
@@ -102,11 +126,14 @@ class PayloadStore:
 
     async def get(self, payload_id: str) -> PayloadRecord | None:
         """Возвращает запись соответствия или None, если её нет/протухла."""
-        if self._redis is not None:
+        if self._redis is not None and self._fernet is not None:
             try:
                 raw = await self._redis.get(self._key_prefix + payload_id)
                 if raw is not None:
-                    return PayloadRecord.from_dict(json.loads(raw))
+                    plaintext = self._fernet.decrypt(raw)
+                    return PayloadRecord.from_dict(json.loads(plaintext.decode("utf-8")))
+            except InvalidToken:
+                logger.warning("Payload store record failed to decrypt, falling back to memory")
             except Exception as e:
                 logger.warning(f"Redis payload store get failed, falling back to memory: {e}")
         return self._get_local(payload_id)

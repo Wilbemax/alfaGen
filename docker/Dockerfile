@@ -2,29 +2,42 @@ FROM python:3.12-slim AS base
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
-    PIP_NO_CACHE_DIR=1
+    PIP_NO_CACHE_DIR=1 \
+    UVICORN_WORKERS=1 \
+    APP_HOST=0.0.0.0 \
+    APP_PORT=8000 \
+    NATASHA_DICTS_PATH=/app/natasha_dicts
 
 WORKDIR /app
 
-# Системные зависимости для spacy и presidio
+# Системные зависимости для рантайма (curl для healthcheck, libgomp1 для Natasha).
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    build-essential \
     libgomp1 \
     curl \
     && rm -rf /var/lib/apt/lists/*
 
-# Копируем зависимости
-COPY pyproject.toml ./
+# Копируем зависимости и метаданные пакета
+COPY pyproject.toml README.md ./
+
+# Устанавливаем зависимости
 RUN pip install --upgrade pip && \
     pip install uv && \
-    uv pip install --system -e .
+    uv pip install --system .
 
 # Копируем код
 COPY app/ ./app/
 
-# Скачиваем модели spacy
-RUN python -m spacy download ru_core_news_md && \
-    python -m spacy download en_core_web_sm
+# Подготовка словарей Natasha/Navec/Slovnet (не блокирует сборку).
+ARG NATASHA_DICTS_URL=""
+RUN if [ -n "$NATASHA_DICTS_URL" ]; then \
+        mkdir -p /app/natasha_dicts && \
+        curl -fsSL "$NATASHA_DICTS_URL" -o /tmp/natasha_dicts.tar.gz && \
+        tar -xzf /tmp/natasha_dicts.tar.gz -C /app/natasha_dicts && \
+        rm -f /tmp/natasha_dicts.tar.gz; \
+    fi
+
+# Неблокирующая проверка импортов Natasha-зависимостей.
+RUN python -c "import natasha, navec, slovnet" || true
 
 # Создаем пользователя без прав
 RUN useradd -m -u 1000 appuser && \
@@ -35,4 +48,4 @@ USER appuser
 
 EXPOSE 8000
 
-CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "4"]
+CMD ["sh", "-c", "uvicorn app.main:app --host ${APP_HOST:-0.0.0.0} --port ${APP_PORT:-8000} --workers ${UVICORN_WORKERS:-1}"]

@@ -16,7 +16,7 @@ async def pipeline():
 
 @pytest.mark.asyncio
 async def test_mask_then_unmask(pipeline, sample_text):
-    """Маскирование, затем демаскирование по тому же payload_id."""
+    """Маскирование, затем демаскирование по тому же payload_id (без system_id)."""
     payload_id = "unit-mask-unmask-1"
     masked = await pipeline.process(sample_text, payload_id)
     assert "test@mail.ru" not in masked
@@ -76,11 +76,45 @@ async def test_store_keeps_record(pipeline, sample_text):
 
 
 @pytest.mark.asyncio
-async def test_unknown_payload_masks_again(pipeline, sample_text):
-    """Payload, не совпадающий ни с исходником, ни с маской, считается новым маскированием."""
-    payload_id = "unit-unknown-1"
+async def test_foreign_text_returns_saved_mask(pipeline, sample_text):
+    """Чужой текст с известным payload_id возвращает сохранённую маску, не перезаписывая пару."""
+    payload_id = "unit-foreign-1"
     masked = await pipeline.process(sample_text, payload_id)
-    # Отправляем произвольную строку — это новое маскирование
     other = "Совершенно другой текст"
     result = await pipeline.process(other, payload_id)
-    assert result != masked
+    assert result == masked
+    # Сохранённая пара не перезаписана
+    record = await payload_store.get(payload_id)
+    assert record is not None
+    assert record.original_text == sample_text
+    assert record.masked_text == masked
+
+
+@pytest.mark.asyncio
+async def test_demask_disabled_returns_mask(pipeline, sample_text, monkeypatch):
+    """При demask_enabled=false второй запрос с маской возвращает маску, не исходник."""
+    profile = {
+        "enabled": True,
+        "demask_enabled": False,
+        "enabled_entity_types": None,
+    }
+    monkeypatch.setattr(
+        pipeline,
+        "_get_profile",
+        lambda system_id: profile if system_id == "support-chat" else pipeline._get_profile(system_id),
+    )
+
+    payload_id = "unit-nounmask-1"
+    masked = await pipeline.process(sample_text, payload_id, system_id="support-chat")
+    second = await pipeline.process(masked, payload_id, system_id="support-chat")
+    assert second == masked
+    assert second != sample_text
+
+
+@pytest.mark.asyncio
+async def test_unmask_allowed_without_system_id(pipeline, sample_text):
+    """Без system_id демаскирование разрешено."""
+    payload_id = "unit-nosys-1"
+    masked = await pipeline.process(sample_text, payload_id)
+    restored = await pipeline.process(masked, payload_id)
+    assert restored == sample_text

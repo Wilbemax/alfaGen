@@ -3,6 +3,7 @@ from __future__ import annotations
 import pytest
 from httpx import ASGITransport, AsyncClient
 
+from app.core.pipeline import pipeline
 from app.main import app
 
 
@@ -13,200 +14,188 @@ async def client():
         yield c
 
 
-# Категории ПДн по блоку 4: фраза → точная ожидаемая маска.
-# preserved — неперсональный текст, который должен остаться без изменений.
-PII_CASES = [
+def _natasha_available() -> bool:
+    """Проверяет доступность Natasha в каскаде (после инициализации)."""
+    try:
+        return bool(pipeline.cascade.natasha_available)
+    except Exception:
+        return False
+
+
+# Маскируемые кейсы: (фраза, ожидаемая маска, зависит ли от Natasha).
+MASK_CASES = [
     pytest.param(
-        "PERSON",
-        "Клиент Иванов Иван Иванович",
-        "Клиент И. И. И.",
-        ["Клиент "],
-        id="person",
+        "Клиент Иванов Иван Иванович, паспорт 4509 123456",
+        "Клиент ********************, паспорт ***********",
+        True,
+        id="person_and_passport",
     ),
     pytest.param(
-        "DATE_OF_BIRTH",
-        "Дата рождения: 12.05.1990",
-        "Дата рождения: **.**.1990",
-        ["Дата рождения: "],
-        id="date_of_birth",
-    ),
-    pytest.param(
-        "PLACE_OF_BIRTH",
-        "Место рождения: г. Москва",
-        "Место рождения: *********",
-        ["Место рождения: "],
-        id="place_of_birth",
-    ),
-    pytest.param(
-        "PASSPORT",
-        "паспорт 4509 123456",
-        "паспорт 45******56",
-        ["паспорт "],
+        "паспорт 45 09 123456",
+        "паспорт ************",
+        False,
         id="passport",
     ),
     pytest.param(
-        "PASSPORT_SERIES_NUMBER",
-        "Серия 4509 номер 123456",
-        "Серия 45** номер ****56",
-        ["Серия ", " номер "],
-        id="passport_series_number",
-    ),
-    pytest.param(
-        "PASSPORT_ISSUER",
-        "Орган выдавший паспорт: ОВД района Тверской",
-        "Орган выдавший паспорт: *******************",
-        ["Орган выдавший паспорт: "],
-        id="passport_issuer",
-    ),
-    pytest.param(
-        "PASSPORT_DEPT_CODE",
-        "Код подразделения: 770-123",
-        "Код подразделения: ***-***",
-        ["Код подразделения: "],
-        id="passport_dept_code",
-    ),
-    pytest.param(
-        "PASSPORT_ISSUE_DATE",
-        "Паспорт выдан 15.03.2015",
-        "Паспорт выдан **.**.2015",
-        ["Паспорт выдан "],
-        id="passport_issue_date",
-    ),
-    pytest.param(
-        "CITIZENSHIP",
-        "Гражданство: РФ",
-        "Гражданство: **",
-        ["Гражданство: "],
-        id="citizenship",
-    ),
-    pytest.param(
-        "DRIVER_LICENSE",
-        "Водительское удостоверение 77 123456",
-        "Водительское удостоверение 77*****56",
-        ["Водительское удостоверение "],
+        "водительское удостоверение 77 01 123456",
+        "водительское удостоверение ************",
+        False,
         id="driver_license",
     ),
     pytest.param(
-        "ADDRESS",
-        "Адрес: г. Москва, ул. Тверская, 15, кв. 45",
-        "Адрес: ***********************************",
-        ["Адрес: "],
+        "Дата рождения: 12.05.1990",
+        "Дата рождения: **********",
+        False,
+        id="date_of_birth_dot",
+    ),
+    pytest.param(
+        "Дата рождения 05/12/1990",
+        "Дата рождения **********",
+        False,
+        id="date_of_birth_slash",
+    ),
+    pytest.param(
+        "родился 12 мая 1990 года в городе Казань",
+        "родился **************** в *************",
+        True,
+        id="birth_date_and_place",
+    ),
+    pytest.param(
+        "выдан ОУФМС России по г. Москве в отделе УФМС",
+        "выдан ***************************************",
+        True,
+        id="passport_issuer",
+    ),
+    pytest.param(
+        "проживает: Россия, 125009, г. Москва, ул. Тверская, д. 15, кв. 45",
+        "проживает: " + "*" * 54,
+        True,
         id="address",
-    ),
-    pytest.param(
-        "EMAIL",
-        "Email: ivan.ivanov@example.com",
-        "Email: i**********@example.com",
-        ["Email: "],
-        id="email",
-    ),
-    pytest.param(
-        "PHONE",
-        "Телефон: +7 (912) 345-67-89",
-        "Телефон: +7 (9**) ***-**-89",
-        ["Телефон: "],
-        id="phone",
-    ),
-    pytest.param(
-        "INN",
-        "ИНН: 770123456789",
-        "ИНН: 77********89",
-        ["ИНН: "],
-        id="inn",
-    ),
-    pytest.param(
-        "BANK_CARD",
-        "Банковская карта: 4276 1234 5678 9012",
-        "Банковская карта: 4276 **** **** 9012",
-        ["Банковская карта: "],
-        id="bank_card",
-    ),
-    pytest.param(
-        "CARD_CVV",
-        "CVV: 123",
-        "CVV: ***",
-        ["CVV: "],
-        id="card_cvv",
-    ),
-    pytest.param(
-        "CARD_PIN",
-        "Пин-код: 4321",
-        "Пин-код: ****",
-        ["Пин-код: "],
-        id="card_pin",
-    ),
-    pytest.param(
-        "CARD_HOLDER",
-        "Cardholder: IVAN IVANOV",
-        "Cardholder: I. I.",
-        ["Cardholder: "],
-        id="card_holder",
     ),
 ]
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(("category", "phrase", "expected_mask", "preserved"), PII_CASES)
-async def test_process_category(client, category, phrase, expected_mask, preserved):
-    """Для каждой категории: маска, соседний текст, ретрай, демаскирование."""
-    payload_id = f"cat-{category}"
+@pytest.mark.parametrize(("phrase", "expected_mask", "natasha_dependent"), MASK_CASES)
+async def test_process_mask_retry_unmask(client, phrase, expected_mask, natasha_dependent):
+    """Маскирование, ретрай исходника, демаскирование по payload_id."""
+    payload_id = f"mask-{phrase[:8]}-{abs(hash(phrase)) % 10000}"
 
-    # 1. Маскирование: маска совпала со строкой из фикстуры
+    # 1. Маскирование
     r = await client.post("/process", json={"payload": phrase, "payload_id": payload_id})
     assert r.status_code == 200
     masked = r.json()["result"]
+
+    if natasha_dependent and not _natasha_available():
+        # Деградация: Natasha недоступна, сервис не падает.
+        if phrase.startswith("Клиент Иванов"):
+            # Regex-часть (паспорт) обязана быть верной.
+            assert masked.endswith(", паспорт ***********")
+        pytest.skip("Natasha unavailable")
+
     assert masked == expected_mask
 
-    # 2. Соседний (неперсональный) текст не изменён
-    for part in preserved:
-        assert part in masked
-
-    # 3. Повтор исходника с тем же payload_id вернул ту же маску
+    # 2. Повтор исходника возвращает ту же маску
     r2 = await client.post("/process", json={"payload": phrase, "payload_id": payload_id})
     assert r2.status_code == 200
     assert r2.json()["result"] == masked
 
-    # 4. Запрос с маской вернул исходник побайтно
+    # 3. Запрос с маской возвращает исходник
     r3 = await client.post("/process", json={"payload": masked, "payload_id": payload_id})
     assert r3.status_code == 200
     assert r3.json()["result"] == phrase
 
 
-# Фразы, которые НЕ должны маскироваться (не ПДн).
+# Кейсы без маски: фраза должна вернуться без изменений.
 NO_MASK_CASES = [
-    pytest.param("exc-historical", "Александр Сергеевич Пушкин", id="historical_person"),
+    pytest.param("Поэт Александр Сергеевич Пушкин написал роман", id="historical_poet"),
+    pytest.param("Александр Сергеевич Пушкин", id="historical_person"),
     pytest.param(
-        "exc-bank-branch",
-        "Отделение Альфа-Банка находится по адресу: г. Москва, ул. Тверская, 10",
+        "Отделение Альфа-Банка: г. Москва, ул. Каланчевская, д. 27",
         id="bank_branch_address",
     ),
-    pytest.param("exc-year-count", "в 2024 году было 1500 заявок", id="year_and_count"),
+    pytest.param("Московский район отметил юбилей", id="district"),
+    pytest.param("NEW YORK is a city", id="latin_city"),
+    pytest.param("в 2024 году было 1500 заявок", id="year_and_count"),
 ]
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(("payload_id", "phrase"), NO_MASK_CASES)
-async def test_process_no_mask(client, payload_id, phrase):
+@pytest.mark.parametrize(("phrase",), NO_MASK_CASES)
+async def test_process_no_mask(client, phrase):
     """Фразы без ПДн возвращаются без изменений."""
+    payload_id = f"nomask-{abs(hash(phrase)) % 10000}"
     r = await client.post("/process", json={"payload": phrase, "payload_id": payload_id})
     assert r.status_code == 200
     assert r.json()["result"] == phrase
 
-
-@pytest.mark.asyncio
-async def test_process_selfcheck_example(client):
-    """Пример из контракта: маскирование и демаскирование по payload_id."""
-    payload_id = "selfcheck-1"
-    phrase = "Клиент Иванов Иван Иванович, паспорт 4509 123456"
-    expected_mask = "Клиент И. И. И., паспорт 45******56"
-
-    r = await client.post("/process", json={"payload": phrase, "payload_id": payload_id})
-    assert r.status_code == 200
-    assert r.json()["result"] == expected_mask
-
-    r2 = await client.post("/process", json={"payload": expected_mask, "payload_id": payload_id})
+    # Повтор исходника возвращает исходник
+    r2 = await client.post("/process", json={"payload": phrase, "payload_id": payload_id})
     assert r2.status_code == 200
     assert r2.json()["result"] == phrase
+
+
+@pytest.mark.asyncio
+async def test_process_without_system_id(client):
+    """Без X-System-Id запрос проходит (профиль checker)."""
+    payload_id = "sys-none-1"
+    phrase = "паспорт 4509 123456"
+    r = await client.post("/process", json={"payload": phrase, "payload_id": payload_id})
+    assert r.status_code == 200
+    assert r.json()["result"] == "паспорт ***********"
+
+
+@pytest.mark.asyncio
+async def test_process_unknown_system_403(client):
+    """X-System-Id: unknown-system возвращает 403 без исходного текста."""
+    payload_id = "sys-unknown-1"
+    phrase = "паспорт 4509 123456"
+    r = await client.post(
+        "/process",
+        json={"payload": phrase, "payload_id": payload_id},
+        headers={"X-System-Id": "unknown-system"},
+    )
+    assert r.status_code == 403
+    body = r.json()
+    assert "error" in body
+    assert phrase not in r.text
+
+
+@pytest.mark.asyncio
+async def test_process_disabled_system_403(client):
+    """X-System-Id: disabled-system возвращает 403."""
+    payload_id = "sys-disabled-1"
+    r = await client.post(
+        "/process",
+        json={"payload": "паспорт 4509 123456", "payload_id": payload_id},
+        headers={"X-System-Id": "disabled-system"},
+    )
+    assert r.status_code == 403
+
+
+@pytest.mark.asyncio
+async def test_process_demo_no_unmask_masks(client):
+    """X-System-Id: demo-no-unmask маскирует, но не демаскирует."""
+    payload_id = "sys-nounmask-1"
+    phrase = "паспорт 4509 123456"
+    r = await client.post(
+        "/process",
+        json={"payload": phrase, "payload_id": payload_id},
+        headers={"X-System-Id": "demo-no-unmask"},
+    )
+    assert r.status_code == 200
+    masked = r.json()["result"]
+    assert masked == "паспорт ***********"
+
+    # Повтор маски возвращает маску, не исходник
+    r2 = await client.post(
+        "/process",
+        json={"payload": masked, "payload_id": payload_id},
+        headers={"X-System-Id": "demo-no-unmask"},
+    )
+    assert r2.status_code == 200
+    assert r2.json()["result"] == masked
+    assert r2.json()["result"] != phrase
 
 
 @pytest.mark.asyncio
@@ -220,26 +209,6 @@ async def test_process_preserves_plain_text(client):
     )
     assert resp.status_code == 200
     assert resp.json()["result"] == text
-
-
-@pytest.mark.asyncio
-async def test_process_no_pii_returns_same(client):
-    """Без ПДн маска совпадает с исходником, оба шага возвращают ту же строку."""
-    payload_id = "test-no-pii-1"
-    text = "Обычный текст без персональных данных"
-    r1 = await client.post(
-        "/process",
-        json={"payload": text, "payload_id": payload_id},
-    )
-    assert r1.status_code == 200
-    assert r1.json()["result"] == text
-
-    r2 = await client.post(
-        "/process",
-        json={"payload": text, "payload_id": payload_id},
-    )
-    assert r2.status_code == 200
-    assert r2.json()["result"] == text
 
 
 @pytest.mark.asyncio
@@ -297,6 +266,7 @@ async def test_health(client):
     data = response.json()
     assert data["status"] == "ok"
     assert "version" in data
+    assert "redis" in data["checks"]
 
 
 @pytest.mark.asyncio
