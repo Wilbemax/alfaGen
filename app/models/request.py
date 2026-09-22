@@ -1,6 +1,7 @@
 from enum import Enum
 from typing import Annotated
-from pydantic import BaseModel, Field, StringConstraints, ConfigDict
+
+from pydantic import BaseModel, ConfigDict, Field, StringConstraints
 
 
 class PIIEntityType(str, Enum):
@@ -26,45 +27,32 @@ class PIIEntityType(str, Enum):
     CARD_HOLDER = "CARD_HOLDER"
 
 
-class ProcessingMode(str, Enum):
-    """Режим обработки"""
-    FULL = "full"           # detect -> mask -> LLM -> unmask
-    MASK_ONLY = "mask_only" # только маскирование
-    UNMASK_ONLY = "unmask_only" # только демаскирование
-    DETECT_ONLY = "detect_only" # только детекция
-
-
 class ProcessRequest(BaseModel):
-    """Запрос на обработку текста"""
+    """Запрос на обработку по контракту AlfaSonar: {payload, payload_id}"""
     model_config = ConfigDict(
-        str_strip_whitespace=True,
+        str_strip_whitespace=False,
         validate_assignment=True,
         extra="forbid",
     )
 
-    system_id: Annotated[str, StringConstraints(min_length=1, max_length=64)] = Field(
+    payload: Annotated[str, StringConstraints(max_length=100_000)] = Field(
         ...,
-        description="Идентификатор системы-потребителя",
-        examples=["crm-system", "loan-scoring", "support-chat"],
+        description="Строка для обработки. На прямом шаге — исходный текст с ПДн; "
+        "на обратном шаге — ранее возвращённая замаскированная строка (тот же payload_id).",
+        examples=["Клиент Иванов Иван Иванович, паспорт 4509 123456"],
     )
-    text: Annotated[str, StringConstraints(min_length=1, max_length=100_000)] = Field(
+    payload_id: Annotated[str, StringConstraints(min_length=1, max_length=128)] = Field(
         ...,
-        description="Текст для обработки",
-        examples=["Уважаемый Иван Иванович Иванов, ваш паспорт 4500 123456..."],
+        description="Идентификатор корреляции. Один и тот же для пары маскирование→демаскирование.",
+        examples=["8a77d363c7c044b49b41d7b8a448243a"],
     )
-    mode: ProcessingMode = Field(
-        default=ProcessingMode.FULL,
-        description="Режим обработки",
-    )
-    llm_prompt: str | None = Field(
-        default=None,
-        description="Дополнительный промпт для LLM (опционально)",
-        max_length=5000,
-    )
-    metadata: dict[str, str] = Field(
-        default_factory=dict,
-        description="Произвольные метаданные запроса",
-    )
+
+
+class ProcessResponse(BaseModel):
+    """Ответ по контракту AlfaSonar: {result}"""
+    model_config = ConfigDict(frozen=True)
+
+    result: str = Field(..., description="Результат обработки (маска или исходная строка)")
 
 
 class PIIEntity(BaseModel):
@@ -77,37 +65,7 @@ class PIIEntity(BaseModel):
     end: int = Field(..., ge=0, description="Конечная позиция в тексте")
     confidence: float = Field(..., ge=0.0, le=1.0, description="Уверенность детектора")
     detector: str = Field(..., description="Название детектора, нашедшего сущность")
-    token: str | None = Field(default=None, description="Токен маскирования (после маскирования)")
-
-
-class DetectOnlyResponse(BaseModel):
-    """Ответ при режиме detect_only"""
-    model_config = ConfigDict(frozen=True)
-
-    entities: list[PIIEntity] = Field(default_factory=list, description="Найденные сущности ПДн")
-    processing_time_ms: float = Field(..., description="Время обработки в мс")
-
-
-class MaskOnlyResponse(BaseModel):
-    """Ответ при режиме mask_only"""
-    model_config = ConfigDict(frozen=True)
-
-    masked_text: str = Field(..., description="Замаскированный текст")
-    entities: list[PIIEntity] = Field(default_factory=list, description="Найденные сущности ПДн")
-    processing_time_ms: float = Field(..., description="Время обработки в мс")
-
-
-class ProcessResponse(BaseModel):
-    """Полный ответ обработки (full mode)"""
-    model_config = ConfigDict(frozen=True)
-
-    original_text: str = Field(..., description="Исходный текст (для проверки)")
-    masked_text: str = Field(..., description="Текст после маскирования (отправлен в LLM)")
-    llm_response: str = Field(..., description="Ответ LLM (еще замаскированный)")
-    unmasked_response: str = Field(..., description="Финальный ответ после демаскирования")
-    entities: list[PIIEntity] = Field(default_factory=list, description="Все обнаруженные сущности")
-    processing_time_ms: float = Field(..., description="Общее время обработки в мс")
-    llm_time_ms: float = Field(..., description="Время ответа LLM в мс")
+    token: str | None = Field(default=None, description="Маска сущности")
 
 
 class ErrorResponse(BaseModel):

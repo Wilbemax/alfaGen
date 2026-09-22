@@ -1,6 +1,5 @@
 from app.core.pipeline import Pipeline, PipelineError, pipeline
 from app.core.masker import Masker, MaskResult, masker
-from app.core.tokenizer import TokenGenerator, token_generator
 
 __all__ = [
     "Pipeline",
@@ -9,6 +8,4 @@ __all__ = [
     "Masker",
     "MaskResult",
     "masker",
-    "TokenGenerator",
-    "token_generator",
 ]

@@ -49,6 +49,10 @@ class AppSettings(BaseSettings):
     rate_limit_burst: int = 2000
     rate_limit_key_prefix: str = "pii_gateway:ratelimit:"
 
+    # Payload store
+    payload_store_ttl_seconds: int = 3600
+    payload_store_key_prefix: str = "pii_gateway:payload:"
+
     # Detector
     natasha_enabled: bool = True
     natasha_confidence_threshold: float = 0.85

@@ -1,13 +1,11 @@
 from __future__ import annotations
-import re
+
+import bisect
 import logging
-from typing import TYPE_CHECKING
+import re
 
 from app.detectors.base import BaseDetector, DetectorConfig
 from app.models.pii import PIIMatch
-
-if TYPE_CHECKING:
-    from app.config.settings import settings as app_settings
 
 logger = logging.getLogger(__name__)
 
@@ -154,6 +152,14 @@ class RegexDetector(BaseDetector):
             ), 0.7),
         ]
 
+        # --- ФИО (2-3 слова с заглавной буквы) ---
+        patterns["PERSON"] = [
+            (re.compile(
+                r"(?<![А-ЯЁа-яё])(?!(?:Клиент|Уважаемый|Гражданин|Гражданка|Господин|Госпожа|Товарищ|Дорогой|Дорогая|Уважаемая)\b)"
+                r"(?:[А-ЯЁ][а-яё]+(?:\s+[А-ЯЁ][а-яё]+){1,2})(?![а-яё])",
+            ), 0.75),
+        ]
+
         return patterns
 
     def _build_exclusions(self) -> list[re.Pattern]:
@@ -180,6 +186,10 @@ class RegexDetector(BaseDetector):
                     if self._is_excluded(matched_text, start, end, text):
                         continue
 
+                    # Исключаем исторических личностей (не ПДн)
+                    if entity_type == "PERSON" and self._is_historical_person(matched_text):
+                        continue
+
                     # Дедупликация (тот же тип, та же позиция)
                     key = (entity_type, start, end)
                     if key in seen:
@@ -198,10 +208,8 @@ class RegexDetector(BaseDetector):
                         detector_name=self.name,
                     ))
 
-        # Возвращаем все совпадения.
-        # Разрешение перекрытий выполняется на уровне CompositeDetector,
-        # где известны разрешенные типы для конкретной системы.
-        return matches
+        # Разрешаем перекрытия (специфичный тип выигрывает у общего)
+        return self._resolve_overlaps(matches)
 
     def _resolve_overlaps(self, matches: list[PIIMatch]) -> list[PIIMatch]:
         """
@@ -224,21 +232,33 @@ class RegexDetector(BaseDetector):
         )
 
         result: list[PIIMatch] = []
+        # Покрытые интервалы, отсортированные по start (для O(log n) проверки перекрытия)
         covered: list[tuple[int, int]] = []
 
         for match in sorted_matches:
-            # Проверяем перекрытие с уже выбранными
-            overlaps = any(
-                match.start < c_end and match.end > c_start
-                for c_start, c_end in covered
-            )
-            if overlaps:
+            if self._overlaps_covered(match.start, match.end, covered):
                 continue
-            covered.append((match.start, match.end))
+            # Вставляем интервал в отсортированную позицию
+            idx = bisect.bisect_left(covered, (match.start, match.end))
+            covered.insert(idx, (match.start, match.end))
             result.append(match)
 
         # Возвращаем в порядке появления в тексте
         return sorted(result, key=lambda m: m.start)
+
+    def _overlaps_covered(self, start: int, end: int, covered: list[tuple[int, int]]) -> bool:
+        """Проверяет перекрытие с уже покрытыми интервалами за O(log n)."""
+        if not covered:
+            return False
+        # Находим первый интервал с start >= нашего start
+        idx = bisect.bisect_right(covered, (start, end))
+        # Проверяем соседние интервалы слева и справа
+        for i in (idx - 1, idx):
+            if 0 <= i < len(covered):
+                c_start, c_end = covered[i]
+                if start < c_end and end > c_start:
+                    return True
+        return False
 
     # Специфичность типов: чем выше, тем более специфичный тип.
     # Используется для разрешения перекрытий (специфичный тип выигрывает у общего).
@@ -316,3 +336,17 @@ class RegexDetector(BaseDetector):
                 return True
 
         return False
+
+    def _is_historical_person(self, matched_text: str) -> bool:
+        """Проверяет, является ли ФИО исторической личностью (не ПДн)."""
+        words = matched_text.split()
+        return any(w in self._historical_persons for w in words)
+
+    # Исторические личности, чьи ФИО не считаются персональными данными
+    _historical_persons: set[str] = {
+        "Пушкин", "Лермонтов", "Толстой", "Достоевский", "Чехов", "Гоголь",
+        "Тургенев", "Бунин", "Шолохов", "Пастернак", "Солженицын", "Бродский",
+        "Ахматова", "Цветаева", "Маяковский", "Есенин", "Блок", "Горький",
+        "Ленин", "Сталин", "Хрущев", "Брежнев", "Горбачев", "Ельцин",
+        "Путин", "Медведев", "Навальный", "Шойгу", "Лавров", "Мишустин",
+    }

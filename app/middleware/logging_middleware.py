@@ -62,15 +62,15 @@ class RequestLoggingMiddleware(BaseHTTPMiddleware):
             )
             return response
 
-        except Exception as e:
+        except Exception:
             duration_ms = (time.monotonic() - start_time) * 1000
+            # Не логируем текст исключения — он может содержать ПДн.
             logger.error(
                 "request_error",
                 extra={
                     "request_id": request_id,
                     "method": method,
                     "path": path,
-                    "error": str(e),
                     "duration_ms": round(duration_ms, 2),
                 },
             )

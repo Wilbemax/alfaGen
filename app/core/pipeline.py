@@ -1,30 +1,12 @@
 from __future__ import annotations
+
 import logging
 import time
-from typing import TYPE_CHECKING
 
-from app.config.settings import settings, pii_rules
 from app.core.masker import masker
-from app.detectors.composite import CompositeDetector
-from app.models.pii import (
-    PIIMatch,
-    RequestContext,
-    get_request_context,
-    set_request_context,
-    clear_request_context,
-)
-from app.models.request import (
-    ProcessRequest,
-    ProcessResponse,
-    DetectOnlyResponse,
-    MaskOnlyResponse,
-    PIIEntity,
-    ProcessingMode,
-)
-from app.services.llm_client import llm_client, LLMClientError
-
-if TYPE_CHECKING:
-    from app.config.settings import settings as app_settings
+from app.core.payload_store import PayloadRecord, payload_store
+from app.detectors.base import DetectorConfig
+from app.detectors.regex_detector import RegexDetector
 
 logger = logging.getLogger(__name__)
 
@@ -35,157 +17,87 @@ class PipelineError(Exception):
 
 class Pipeline:
     """
-    Главный pipeline обработки:
-    detect -> mask -> LLM -> unmask
+    Pipeline по контракту AlfaSonar.
+
+    Направление определяется по payload_id и содержимому payload:
+      - новый payload_id — маскирование (payload = исходная строка), возвращает маску
+        и сохраняет пару «исходник ↔ маска» по payload_id;
+      - тот же payload_id и payload == сохранённый исходник — ретрай маскирования,
+        возвращает ту же маску без пересчёта;
+      - тот же payload_id и payload == сохранённая маска — демаскирование,
+        возвращает исходную строку;
+      - если ПДн нет и маска совпала с исходником, оба шага возвращают эту же строку.
+
+    Горячий путь использует только regex-детектор и не обращается к LLM,
+    не загружает Natasha или Presidio.
     """
 
     def __init__(self) -> None:
-        self.detector = CompositeDetector()
+        self.detector = RegexDetector(DetectorConfig(enabled=True, confidence_threshold=0.5))
         self._initialized = False
 
     async def initialize(self) -> None:
-        """Инициализация всех компонентов"""
+        """Инициализация regex-детектора и хранилища."""
         if self._initialized:
             return
-
-        self.detector.configure(
-            strategy=settings.composite_strategy,
-            deduplicate=settings.composite_deduplicate,
-            min_confidence=settings.composite_min_confidence,
-            natasha_enabled=settings.natasha_enabled,
-            presidio_enabled=settings.presidio_enabled,
-            regex_enabled=settings.regex_enabled,
-        )
         await self.detector.initialize()
-        await llm_client.initialize()
+        await payload_store.initialize()
         self._initialized = True
-        logger.info("Pipeline initialized")
+        logger.info("Pipeline initialized (regex-only hot path)")
 
-    async def process(self, request: ProcessRequest) -> ProcessResponse | DetectOnlyResponse | MaskOnlyResponse:
+    async def close(self) -> None:
+        """Закрытие ресурсов хранилища."""
+        await payload_store.close()
+
+    async def process(self, payload: str, payload_id: str) -> str:
         """
-        Обрабатывает запрос согласно режиму.
-        Создает request-scoped контекст, который очищается после обработки.
+        Обрабатывает payload по payload_id.
+        Возвращает маску (новый id / ретрай) или исходную строку (демаскирование).
         """
         start_time = time.monotonic()
 
-        # Ленивая инициализация (на случай, если lifespan не был вызван)
         if not self._initialized:
             await self.initialize()
 
-        # Создаем request-scoped контекст
-        ctx = RequestContext()
-        set_request_context(ctx)
-
-        try:
-            # Получаем конфигурацию системы
-            system_config = pii_rules.get_system_config(request.system_id)
-            enabled_types = set(system_config.get("enabled_entity_types", []))
-            exclusions = system_config.get("exclusions", {})
-
-            # Проверяем длину текста
-            if len(request.text) > settings.pipeline_max_text_length:
-                raise PipelineError(f"Text too long: {len(request.text)} > {settings.pipeline_max_text_length}")
-
-            # Режим detect_only
-            if request.mode == ProcessingMode.DETECT_ONLY:
-                entities = await self._detect(request.text, enabled_types, exclusions)
-                return DetectOnlyResponse(
-                    entities=[e.to_entity() for e in entities],
-                    processing_time_ms=(time.monotonic() - start_time) * 1000,
+        existing = await payload_store.get(payload_id)
+        if existing is not None:
+            if payload == existing.original_text:
+                # Ретрай маскирования: возвращаем ту же маску, не пересчитываем
+                logger.info(
+                    "process_mask_retry",
+                    extra={"payload_id": payload_id, "duration_ms": round((time.monotonic() - start_time) * 1000, 2)},
                 )
-
-            # Режим mask_only
-            if request.mode == ProcessingMode.MASK_ONLY:
-                entities = await self._detect(request.text, enabled_types, exclusions)
-                mask_result = masker.mask(request.text, entities, ctx)
-                return MaskOnlyResponse(
-                    masked_text=mask_result.masked_text,
-                    entities=[e.to_entity() for e in mask_result.entities],
-                    processing_time_ms=(time.monotonic() - start_time) * 1000,
+                return existing.masked_text
+            if payload == existing.masked_text:
+                # Демаскирование: возвращаем исходник
+                logger.info(
+                    "process_unmask",
+                    extra={"payload_id": payload_id, "duration_ms": round((time.monotonic() - start_time) * 1000, 2)},
                 )
+                return existing.original_text
 
-            # Режим unmask_only
-            if request.mode == ProcessingMode.UNMASK_ONLY:
-                # В этом режиме контекст должен быть передан через metadata
-                # (для простоты считаем, что текст уже замаскирован и контекст пуст)
-                unmasked = masker.unmask(request.text, ctx)
-                return ProcessResponse(
-                    original_text=request.text,
-                    masked_text=request.text,
-                    llm_response="",
-                    unmasked_response=unmasked,
-                    entities=[],
-                    processing_time_ms=(time.monotonic() - start_time) * 1000,
-                    llm_time_ms=0,
-                )
-
-            # Полный режим: detect -> mask -> LLM -> unmask
-            return await self._process_full(request, ctx, enabled_types, exclusions, start_time)
-
-        finally:
-            # Всегда очищаем контекст (даже при ошибке)
-            clear_request_context()
-
-    async def _detect(
-        self,
-        text: str,
-        enabled_types: set[str],
-        exclusions: dict,
-    ) -> list[PIIMatch]:
-        """Детекция ПДн с фильтрацией по типам и исключениям"""
-        matches = await self.detector(text)
-        matches = self.detector.filter_by_types(matches, enabled_types)
-        # Разрешаем перекрытия ПОСЛЕ фильтрации по типам,
-        # чтобы не терять менее специфичные типы (например, PASSPORT_SERIES)
-        matches = self.detector.resolve_overlaps(matches)
-        matches = self.detector.apply_exclusions(matches, exclusions)
-
-        # Ограничиваем количество сущностей
-        if len(matches) > settings.pipeline_max_entities_per_request:
-            matches = matches[: settings.pipeline_max_entities_per_request]
-
-        return matches
-
-    async def _process_full(
-        self,
-        request: ProcessRequest,
-        ctx: RequestContext,
-        enabled_types: set[str],
-        exclusions: dict,
-        start_time: float,
-    ) -> ProcessResponse:
-        """Полный pipeline: detect -> mask -> LLM -> unmask"""
-        # 1. Детекция
-        entities = await self._detect(request.text, enabled_types, exclusions)
-
-        # 2. Маскирование
-        mask_result = masker.mask(request.text, entities, ctx)
-        masked_text = mask_result.masked_text
-
-        # 3. Отправка в LLM
-        llm_start = time.monotonic()
-        try:
-            llm_response = await llm_client.generate(
-                prompt=masked_text,
-                system_prompt=request.llm_prompt,
-            )
-        except LLMClientError as e:
-            logger.error(f"LLM error: {e}")
-            raise PipelineError(f"LLM processing failed: {e}") from e
-        llm_time_ms = (time.monotonic() - llm_start) * 1000
-
-        # 4. Демаскирование ответа LLM
-        unmasked_response = masker.unmask(llm_response, ctx)
-
-        return ProcessResponse(
-            original_text=request.text,
-            masked_text=masked_text,
-            llm_response=llm_response,
-            unmasked_response=unmasked_response,
-            entities=[e.to_entity() for e in mask_result.entities],
-            processing_time_ms=(time.monotonic() - start_time) * 1000,
-            llm_time_ms=llm_time_ms,
+        # Новый payload_id или payload не совпал ни с исходником, ни с маской
+        result = await self._mask(payload, payload_id)
+        logger.info(
+            "process_mask",
+            extra={"payload_id": payload_id, "duration_ms": round((time.monotonic() - start_time) * 1000, 2)},
         )
+        return result
+
+    async def _mask(self, payload: str, payload_id: str) -> str:
+        """Маскирование: детекция + маска + сохранение соответствия."""
+        entities = await self.detector(payload)
+        mask_result = masker.mask(payload, entities)
+
+        await payload_store.put(
+            payload_id,
+            PayloadRecord(
+                original_text=payload,
+                masked_text=mask_result.masked_text,
+                entity_types=mask_result.entity_types,
+            ),
+        )
+        return mask_result.masked_text
 
 
 # Глобальный экземпляр pipeline

@@ -2,101 +2,84 @@ from __future__ import annotations
 import pytest
 
 from app.core.pipeline import Pipeline
-from app.models.request import ProcessRequest, ProcessingMode
+from app.core.payload_store import payload_store
 
 
 @pytest.fixture
 async def pipeline():
     p = Pipeline()
     await p.initialize()
-    return p
+    yield p
+    payload_store.clear()
 
 
 @pytest.mark.asyncio
-async def test_detect_only_mode(pipeline, sample_text):
-    request = ProcessRequest(
-        system_id="crm-system",
-        text=sample_text,
-        mode=ProcessingMode.DETECT_ONLY,
-    )
-    result = await pipeline.process(request)
-    assert result.entities
-    assert any(e.type.value == "EMAIL" for e in result.entities)
-    assert any(e.type.value == "PHONE" for e in result.entities)
+async def test_mask_then_unmask(pipeline, sample_text):
+    """Маскирование, затем демаскирование по тому же payload_id."""
+    payload_id = "unit-mask-unmask-1"
+    masked = await pipeline.process(sample_text, payload_id)
+    assert "test@mail.ru" not in masked
+    assert "770123456789" not in masked
+
+    unmasked = await pipeline.process(masked, payload_id)
+    assert unmasked == sample_text
 
 
 @pytest.mark.asyncio
-async def test_mask_only_mode(pipeline, sample_text):
-    request = ProcessRequest(
-        system_id="crm-system",
-        text=sample_text,
-        mode=ProcessingMode.MASK_ONLY,
-    )
-    result = await pipeline.process(request)
-    assert result.masked_text
-    assert "test@mail.ru" not in result.masked_text
-    assert "[EMAIL_1]" in result.masked_text
+async def test_mask_retry_returns_same_mask(pipeline, sample_text):
+    """Ретрай маскирования с тем же исходником возвращает ту же маску без пересчёта."""
+    payload_id = "unit-retry-1"
+    masked1 = await pipeline.process(sample_text, payload_id)
+    masked2 = await pipeline.process(sample_text, payload_id)
+    assert masked1 == masked2
 
 
 @pytest.mark.asyncio
-async def test_mask_only_preserves_plain_text(pipeline):
-    request = ProcessRequest(
-        system_id="crm-system",
-        text="Обычный текст без ПДн",
-        mode=ProcessingMode.MASK_ONLY,
-    )
-    result = await pipeline.process(request)
-    assert result.masked_text == "Обычный текст без ПДн"
-    assert result.entities == []
+async def test_mask_preserves_plain_text(pipeline):
+    """Без ПДн маска совпадает с исходником, оба шага возвращают ту же строку."""
+    payload_id = "unit-plain-1"
+    text = "Обычный текст без ПДн"
+    result1 = await pipeline.process(text, payload_id)
+    assert result1 == text
+    result2 = await pipeline.process(text, payload_id)
+    assert result2 == text
 
 
 @pytest.mark.asyncio
-async def test_exclusions_historical_persons(pipeline, sample_text_with_exclusions):
-    """Исторические личности не должны маскироваться"""
-    request = ProcessRequest(
-        system_id="crm-system",
-        text=sample_text_with_exclusions,
-        mode=ProcessingMode.MASK_ONLY,
-    )
-    result = await pipeline.process(request)
-    # Пушкин и Толстой не должны быть замаскированы
-    assert "Пушкин" in result.masked_text
-    assert "Толстой" in result.masked_text
+async def test_new_payload_id_masks(pipeline, sample_text):
+    """Новый payload_id всегда маскирует."""
+    masked1 = await pipeline.process(sample_text, "unit-new-1")
+    masked2 = await pipeline.process(sample_text, "unit-new-2")
+    assert masked1 == masked2
 
 
 @pytest.mark.asyncio
-async def test_system_specific_rules(pipeline, sample_text):
-    """Разные system_id должны иметь разные правила"""
-    # crm-system не включает PASSPORT
-    request_crm = ProcessRequest(
-        system_id="crm-system",
-        text=sample_text,
-        mode=ProcessingMode.DETECT_ONLY,
-    )
-    result_crm = await pipeline.process(request_crm)
-    crm_types = {e.type.value for e in result_crm.entities}
-    assert "PASSPORT_SERIES" not in crm_types
-
-    # loan-scoring включает PASSPORT
-    request_loan = ProcessRequest(
-        system_id="loan-scoring",
-        text=sample_text,
-        mode=ProcessingMode.DETECT_ONLY,
-    )
-    result_loan = await pipeline.process(request_loan)
-    loan_types = {e.type.value for e in result_loan.entities}
-    assert "PASSPORT_SERIES" in loan_types
+async def test_unmask_restores_original(pipeline, sample_text):
+    """Демаскирование возвращает исходную строку."""
+    payload_id = "unit-restore-1"
+    masked = await pipeline.process(sample_text, payload_id)
+    restored = await pipeline.process(masked, payload_id)
+    assert restored == sample_text
 
 
 @pytest.mark.asyncio
-async def test_context_cleared_after_processing(pipeline, sample_text):
-    """Контекст должен очищаться после обработки"""
-    from app.models.pii import request_context
+async def test_store_keeps_record(pipeline, sample_text):
+    """Запись хранит исходник, маску и типы сущностей."""
+    payload_id = "unit-record-1"
+    masked = await pipeline.process(sample_text, payload_id)
+    record = await payload_store.get(payload_id)
+    assert record is not None
+    assert record.original_text == sample_text
+    assert record.masked_text == masked
+    assert record.entity_types
 
-    request = ProcessRequest(
-        system_id="crm-system",
-        text=sample_text,
-        mode=ProcessingMode.MASK_ONLY,
-    )
-    await pipeline.process(request)
-    assert request_context.get() is None
+
+@pytest.mark.asyncio
+async def test_unknown_payload_masks_again(pipeline, sample_text):
+    """Payload, не совпадающий ни с исходником, ни с маской, считается новым маскированием."""
+    payload_id = "unit-unknown-1"
+    masked = await pipeline.process(sample_text, payload_id)
+    # Отправляем произвольную строку — это новое маскирование
+    other = "Совершенно другой текст"
+    result = await pipeline.process(other, payload_id)
+    assert result != masked

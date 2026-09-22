@@ -1,28 +1,31 @@
 from __future__ import annotations
+
 import logging
 import time
 from contextlib import asynccontextmanager
 from typing import TYPE_CHECKING
 
-from fastapi import FastAPI, Request, HTTPException, Depends
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
-from prometheus_client import generate_latest, CONTENT_TYPE_LATEST
+from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
 
-from app.config.settings import settings
-from app.core.pipeline import pipeline, PipelineError
-from app.middleware.logging_middleware import RequestLoggingMiddleware, MetricsMiddleware
+from app.core.pipeline import PipelineError, pipeline
+from app.middleware.logging_middleware import MetricsMiddleware, RequestLoggingMiddleware
 from app.models.request import (
-    ProcessRequest,
-    ProcessResponse,
-    DetectOnlyResponse,
-    MaskOnlyResponse,
     ErrorResponse,
     HealthResponse,
+    ProcessRequest,
+    ProcessResponse,
 )
 from app.services.rate_limiter import rate_limiter
+from app.utils.logging_setup import setup_logging
 
 if TYPE_CHECKING:
     from starlette.responses import Response
+
+# Настраиваем логирование с санитизацией ПДн до создания приложения,
+# чтобы фильтр был активен для всех логгеров (включая uvicorn).
+setup_logging()
 
 logger = logging.getLogger(__name__)
 
@@ -33,6 +36,8 @@ _start_time = time.monotonic()
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Lifespan: инициализация и очистка ресурсов"""
+    # Идемпотентно гарантируем санитизацию ПДн в логах независимо от точки входа.
+    setup_logging()
     logger.info("Starting PII Masking Gateway...")
     await pipeline.initialize()
     await rate_limiter.initialize()
@@ -40,6 +45,7 @@ async def lifespan(app: FastAPI):
     yield
     logger.info("Shutting down PII Masking Gateway...")
     await rate_limiter.close()
+    await pipeline.close()
     logger.info("PII Masking Gateway stopped")
 
 
@@ -72,7 +78,7 @@ async def health() -> HealthResponse:
 
 
 @app.get("/metrics", tags=["metrics"])
-async def metrics() -> "Response":
+async def metrics() -> Response:
     """Prometheus metrics endpoint"""
     from starlette.responses import Response
     return Response(
@@ -83,7 +89,7 @@ async def metrics() -> "Response":
 
 @app.post(
     "/process",
-    response_model=ProcessResponse | DetectOnlyResponse | MaskOnlyResponse,
+    response_model=ProcessResponse,
     tags=["processing"],
     responses={
         429: {"model": ErrorResponse, "description": "Rate limit exceeded"},
@@ -94,15 +100,19 @@ async def metrics() -> "Response":
 async def process_request(
     request: ProcessRequest,
     http_request: Request,
-) -> ProcessResponse | DetectOnlyResponse | MaskOnlyResponse:
+) -> ProcessResponse:
     """
-    Обрабатывает текст: детектирует ПДн, маскирует перед LLM, демаскирует ответ.
+    Обрабатывает текст по контракту AlfaSonar.
+
+    Направление определяется по payload_id:
+      - первый запрос с новым payload_id — маскирование;
+      - второй запрос с тем же payload_id — демаскирование.
     """
     request_id = getattr(http_request.state, "request_id", "unknown")
 
     # Rate limiting
     allowed = await rate_limiter.check(
-        key=f"{request.system_id}:{http_request.client.host if http_request.client else 'unknown'}",
+        key=f"{request.payload_id}:{http_request.client.host if http_request.client else 'unknown'}",
     )
     if not allowed:
         raise HTTPException(
@@ -112,25 +122,28 @@ async def process_request(
                 message="Too many requests",
                 request_id=request_id,
             ).model_dump(),
+            headers={"Retry-After": "1"},
         )
 
     try:
-        result = await pipeline.process(request)
-        return result
+        result = await pipeline.process(request.payload, request.payload_id)
+        return ProcessResponse(result=result)
 
-    except PipelineError as e:
-        logger.error(f"Pipeline error: {e}", extra={"request_id": request_id})
+    except PipelineError:
+        # Не логируем текст исключения — он может содержать ПДн.
+        logger.error("pipeline_error", extra={"request_id": request_id})
         raise HTTPException(
-            status_code=400,
+            status_code=500,
             detail=ErrorResponse(
                 error="pipeline_error",
-                message=str(e),
+                message="Internal processing error",
                 request_id=request_id,
             ).model_dump(),
         )
 
-    except Exception as e:
-        logger.error(f"Unexpected error: {e}", extra={"request_id": request_id})
+    except Exception:
+        # Не логируем текст исключения — он может содержать ПДн.
+        logger.error("internal_error", extra={"request_id": request_id})
         raise HTTPException(
             status_code=500,
             detail=ErrorResponse(
@@ -147,4 +160,5 @@ async def http_exception_handler(request: Request, exc: HTTPException) -> JSONRe
     return JSONResponse(
         status_code=exc.status_code,
         content=exc.detail,
+        headers=exc.headers,
     )
