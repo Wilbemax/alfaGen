@@ -13,7 +13,7 @@ logger = logging.getLogger(__name__)
 
 
 class RegexDetector(BaseDetector):
-    """Detect only the structured PII types assigned to the regex layer."""
+    """Ищет только структурированные типы ПДн, назначенные regex-слою."""
 
     _CONTEXT_RADIUS = 40
     _DATE = re.compile(
@@ -270,7 +270,7 @@ class RegexDetector(BaseDetector):
         )
 
     def _resolve_overlaps(self, matches: list[PIIMatch]) -> list[PIIMatch]:
-        """Resolve overlaps before confidence filtering; specificity and length win."""
+        """Снимает перекрытия до фильтрации: важнее специфичность и длина."""
         ranked = sorted(
             matches,
             key=lambda item: (

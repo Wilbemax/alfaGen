@@ -7,7 +7,7 @@ from app.models.pii import PIIMatch
 
 @dataclass(slots=True)
 class MaskResult:
-    """Result of masking, including positions required for local unmasking."""
+    """Результат маскирования с позициями, необходимыми для демаскирования."""
 
     masked_text: str
     spans: list[tuple[int, int, str]] = field(default_factory=list)
@@ -15,7 +15,7 @@ class MaskResult:
 
 
 class Masker:
-    """Mask accepted half-open spans without exposing any character inside them."""
+    """Маскирует принятые полуинтервалы, не раскрывая символы внутри них."""
 
     def mask(self, text: str, entities: list[PIIMatch]) -> MaskResult:
         if not entities:
