@@ -22,9 +22,10 @@ services:
       - REDIS_PASSWORD=${REDIS_PASSWORD:-}
       - REDIS_SOCKET_TIMEOUT=0.2
       - REDIS_SOCKET_CONNECT_TIMEOUT=0.2
-      # PAYLOAD_STORE_KEY обязателен для multi-worker (UVICORN_WORKERS > 1):
-      # без него in-memory fallback запрещён и сервис не стартует.
-      - PAYLOAD_STORE_KEY=${PAYLOAD_STORE_KEY:-}
+      # Ключ обязателен, без default. Memory fallback в этом контуре запрещён.
+      - PAYLOAD_STORE_KEY=${PAYLOAD_STORE_KEY:?PAYLOAD_STORE_KEY is required}
+      - PAYLOAD_STORE_ALLOW_MEMORY_FALLBACK=false
+      - PAYLOAD_STORE_TTL_SECONDS=3600
       - RATE_LIMIT_ENABLED=true
       - RATE_LIMIT_DEFAULT_RPS=1500
       - RATE_LIMIT_BURST=2000

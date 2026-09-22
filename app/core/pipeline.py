@@ -8,7 +8,13 @@ from typing import Any
 
 from app.config.settings import pii_rules, settings
 from app.core.masker import MaskResult, masker
-from app.core.payload_store import PayloadRecord, payload_store
+from app.core.payload_store import (
+    PayloadRecord,
+    PayloadStore,
+    PayloadStoreError,
+    normalize_scope,
+    payload_store,
+)
 from app.detectors.cascade import CascadeDetector
 from app.utils.metrics import observe_entities, observe_tokens
 from app.utils.tokenizer import count_tokens
@@ -35,22 +41,23 @@ class Pipeline:
         не перезаписывая пару.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, store: PayloadStore | None = None) -> None:
         self.cascade = CascadeDetector()
         self._initialized = False
+        self._store = store if store is not None else payload_store
 
     async def initialize(self) -> None:
         """Инициализация каскада детекторов и хранилища."""
         if self._initialized:
             return
         await self.cascade.initialize()
-        await payload_store.initialize()
+        await self._store.initialize()
         self._initialized = True
         logger.info("Pipeline initialized")
 
     async def close(self) -> None:
         """Закрытие ресурсов хранилища."""
-        await payload_store.close()
+        await self._store.close()
 
     def _get_profile(self, system_id: str | None) -> dict[str, Any]:
         """Профиль системы из pii_rules."""
@@ -72,7 +79,11 @@ class Pipeline:
         if not self._initialized:
             await self.initialize()
 
-        existing = await payload_store.get(payload_id)
+        scope = normalize_scope(system_id)
+        try:
+            existing = await self._store.get(scope, payload_id)
+        except PayloadStoreError:
+            raise PipelineError("storage_error") from None
         if existing is not None:
             if payload == existing.original_text:
                 # Ретрай маскирования: возвращаем ту же маску, не пересчитываем
@@ -91,7 +102,7 @@ class Pipeline:
             return existing.masked_text
 
         # Новый payload_id: маскирование
-        result = await self._mask(payload, payload_id, profile)
+        result = await self._mask(payload, payload_id, profile, scope)
         self._log_entities("process_mask", result.entity_types, start_time, payload_id)
         return result.masked_text
 
@@ -108,7 +119,13 @@ class Pipeline:
             },
         )
 
-    async def _mask(self, payload: str, payload_id: str, profile: dict[str, Any]) -> MaskResult:
+    async def _mask(
+        self,
+        payload: str,
+        payload_id: str,
+        profile: dict[str, Any],
+        scope: str,
+    ) -> MaskResult:
         """Маскирование: детекция + маска + сохранение соответствия."""
         allowed_types = profile.get("enabled_entity_types")
         if isinstance(allowed_types, list):
@@ -128,14 +145,18 @@ class Pipeline:
         observe_entities(mask_result.entity_types)
         observe_tokens(count_tokens(payload))
 
-        await payload_store.put(
-            payload_id,
-            PayloadRecord(
-                original_text=payload,
-                masked_text=mask_result.masked_text,
-                entity_types=mask_result.entity_types,
-            ),
-        )
+        try:
+            await self._store.put(
+                scope,
+                payload_id,
+                PayloadRecord(
+                    original_text=payload,
+                    masked_text=mask_result.masked_text,
+                    entity_types=mask_result.entity_types,
+                ),
+            )
+        except PayloadStoreError:
+            raise PipelineError("storage_error") from None
         return mask_result
 
 
