@@ -46,10 +46,9 @@ class ContextFilter:
         normalized = [
             m
             for m in matches
-            if m.start >= 0
-            and m.end <= len(text)
-            and m.start < m.end
+            if 0 <= m.start < m.end <= len(text)
             and text[m.start:m.end] == m.text
+            and 0.0 <= m.confidence <= 1.0
         ]
         resolved = self._resolve_overlaps(normalized)
         resolved = [m for m in resolved if m.confidence >= CONFIDENCE_THRESHOLD]
@@ -144,13 +143,13 @@ class ContextFilter:
 
         # Служебные слова в начале/конце обрезаем: создаём новый спан.
         if start_idx > 0 or end_idx < len(words):
-            pattern = r"\s+".join(re.escape(w) for w in remaining)
-            match = re.search(pattern, m.text)
-            if match is None:
+            pattern = r"\s+".join(re.escape(word) for word in remaining)
+            located = re.search(pattern, m.text)
+            if located is None:
                 return True
-            new_start = m.start + match.start()
-            new_end = m.start + match.end()
-            new_text = m.text[match.start():match.end()]
+            new_start = m.start + located.start()
+            new_end = m.start + located.end()
+            new_text = m.text[located.start():located.end()]
             if len(new_text.split()) < 2:
                 return True
             m = PIIMatch(
@@ -185,4 +184,7 @@ class ContextFilter:
 
     def _card_holder_kept(self, text: str, m: PIIMatch) -> bool:
         window = text[max(0, m.start - 40): min(len(text), m.end + 40)].lower()
-        return any(k in window for k in ("держатель", "cardholder", "holder"))
+        return any(
+            keyword in window
+            for keyword in ("держатель", "держателя", "cardholder", "holder")
+        )

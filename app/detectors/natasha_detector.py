@@ -37,21 +37,44 @@ _DIRECT_ADDRESS_SPAN_SIGNAL = re.compile(
     r"|(?<![\w])г\.|город\w*)"
 )
 _BIRTH_CUES = ("место рождения", "родился", "родилась")
-_ISSUER_CUES = ("выдан", "выдано", "уфмс", "оуфмс", "мвд", "овд")
-_SERVICE_PREFIX = re.compile(r"(?iu)(?:поэт|клиент|уважаемый)\s+")
-_ISSUER_PREFIX = re.compile(r"(?iu)(?:выдан|выдано)\s+")
+_ISSUER_CUES = ("выдан", "выдано", "кем выдан", "орган", "уфмс", "оуфмс", "мвд", "овд")
+_SERVICE_PREFIX = re.compile(
+    r"(?iu)(?:поэт|клиент|заявитель|уважаемый|на\s+имя)\s+"
+)
+_ISSUER_PREFIX = re.compile(
+    r"(?iu)(?:(?:кем\s+)?выдано?|орган)\s*:?\s*"
+)
 _PLACE_LEFT = re.compile(
     r"(?iu)(?:городе|город|г\.|улица|ул\.?|проспект|пр-т|шоссе"
     r"|переулок|пер\.?|область|обл\.?|район|р-н|республика|край)\s+$"
 )
-_ADDRESS_SERVICE_PREFIX = re.compile(r"(?iu)\bпроживает\b[ \t]*:[ \t]*")
+_ADDRESS_SERVICE_PREFIX = re.compile(
+    r"(?iu)(?:\bпроживает\b|\bадрес(?:\s+регистрации)?\b)[ \t]*:[ \t]*"
+)
 _STRUCTURED_ADDRESS_COMPONENT = re.compile(
     r"(?iu)^(?:\d{6}"
+    r"|(?:росси(?:я|и|ю)|рф|казахстан|беларусь)\b"
     r"|(?:г\.?|город|ул\.?|улица|проспект|пр-т|д\.?|дом|корп\.?|корпус"
     r"|стр\.?|строение|кв\.?|квартира|индекс|обл\.?|область|район|р-н"
     r"|республика|край|шоссе|переулок|пер\.?)(?=[ \t]|$)"
     r"|[а-яё][а-яё .-]*[ \t]+(?:область|район|край|шоссе|переулок)\b)"
 )
+_ADDRESS_FIELD_BOUNDARY = re.compile(
+    r"(?iu)\s+(?=(?:паспорт|код\s+подразделения|инн|телефон|(?:e-?mail|почта)\b"
+    r"|карта\b|гражданство|дата\s+рождения|водительское\s+удостоверение|права\b))"
+)
+_ISSUER_VALUE = re.compile(
+    r"(?u)(?i:О?УФМС|УФМС|ОВД|МВД)"
+    r"(?:\s+(?i:России))?"
+    r"(?:\s+(?i:по)\s+(?:(?i:г)\.\s*|(?i:городу)\s+|(?i:Республике)\s+)?"
+    r"[А-ЯЁ][а-яё-]+(?:\s+[А-ЯЁ][а-яё-]+)?"
+    r"|\s+(?i:района|города)\s+[А-ЯЁ][а-яё-]+)?"
+)
+_CONTEXT_PERSON = re.compile(
+    r"(?u)(?i:(?<![а-яё])(?:заявитель|клиент|на\s+имя)(?![а-яё]))"
+    r"[ \t]+(?P<value>[А-ЯЁ][а-яё-]+(?:[ \t]+[А-ЯЁ][а-яё-]+){2})"
+)
+_PERSON_WORD = re.compile(r"(?u)[А-ЯЁ][а-яё-]+")
 
 
 class NatashaDetector(BaseDetector):
@@ -150,6 +173,7 @@ class NatashaDetector(BaseDetector):
         if deadline_monotonic is not None and time.monotonic() >= deadline_monotonic:
             return []
         expanded = _expand_address_matches(text, matches, covered, self.name)
+        expanded.extend(_recover_context_people(text, raw_spans, covered, self.name))
         deduplicated = {
             (match.entity_type, match.start, match.end): match for match in expanded
         }
@@ -193,6 +217,7 @@ class NatashaDetector(BaseDetector):
         label = tag.upper()
         if label == "PER":
             start = _consume_prefix(text, start, end, _SERVICE_PREFIX)
+            start, end = _expand_person_span(text, start, end)
             entity_type = "PERSON"
         elif label == "LOC":
             start = _expand_place_left(text, start)
@@ -204,11 +229,10 @@ class NatashaDetector(BaseDetector):
             else:
                 return None
         elif label == "ORG":
-            window = _window(text, start, end)
-            if not any(cue in window for cue in _ISSUER_CUES):
+            if not _issuer_context_for_span(text, start, end):
                 return None
             start = _consume_prefix(text, start, end, _ISSUER_PREFIX)
-            end = _extend_issuer(text, start, end)
+            end = _issuer_end(text, start, end)
             entity_type = "PASSPORT_ISSUER"
         else:
             return None
@@ -272,6 +296,100 @@ def _address_cue_for_span(text: str, start: int, end: int) -> bool:
         _ADDRESS_SIGNAL.search(left) is not None
         or _DIRECT_ADDRESS_SPAN_SIGNAL.search(span) is not None
     )
+
+
+def _issuer_context_for_span(text: str, start: int, end: int) -> bool:
+    """Требует локальный issuer-маркер перед ORG либо внутри самого ORG."""
+    span = text[start:end].casefold()
+    if re.search(r"(?u)\b(?:о?уфмс|овд|мвд)\b", span):
+        return True
+    left = text[max(0, start - 32):start].casefold()
+    return re.search(
+        r"(?u)(?:(?:кем\s+)?выдано?|орган)\s*[:—-]?\s*$",
+        left,
+    ) is not None
+
+
+def _issuer_end(text: str, start: int, ner_end: int) -> int:
+    """Расширяет ORG только по грамматике названия органа, не по всему тексту."""
+    structured = _ISSUER_VALUE.match(text, start)
+    if structured is not None:
+        return structured.end()
+    return _trim_terminal_punctuation(text, start, ner_end)
+
+
+def _expand_person_span(text: str, start: int, end: int) -> tuple[int, int]:
+    """Дополняет частичный PER соседними компонентами очевидного полного ФИО."""
+    left = text[max(0, start - 32):start]
+    context = re.search(
+        r"(?iu)(?:заявитель|клиент|на\s+имя)\s+$",
+        left,
+    )
+    if context is not None:
+        candidate = _CONTEXT_PERSON.search(
+            text,
+            max(0, start - 32),
+            min(len(text), end + 48),
+        )
+        if (
+            candidate is not None
+            and candidate.start("value") <= start < candidate.end("value")
+        ):
+            return candidate.span("value")
+
+    words = list(
+        _PERSON_WORD.finditer(
+            text,
+            max(0, start - 24),
+            min(len(text), end + 32),
+        )
+    )
+    containing = [
+        index
+        for index, word in enumerate(words)
+        if word.start() < end and word.end() > start
+    ]
+    if not containing:
+        return start, end
+    first = containing[0]
+    last = containing[-1]
+    while first > 0 and text[words[first - 1].end():words[first].start()].isspace():
+        first -= 1
+    while (
+        last + 1 < len(words)
+        and text[words[last].end():words[last + 1].start()].isspace()
+    ):
+        last += 1
+    if last - first + 1 == 3:
+        return words[first].start(), words[last].end()
+    return start, end
+
+
+def _recover_context_people(
+    text: str,
+    raw_spans: list[tuple[int, int, str, float]],
+    covered: list[tuple[int, int]],
+    detector_name: str,
+) -> list[PIIMatch]:
+    """Ограниченный fallback для трёхчастного ФИО после сильного контекста."""
+    person_anchors = [
+        (start, end)
+        for start, end, tag, _score in raw_spans
+        if str(tag).upper() == "PER"
+    ]
+    recovered: list[PIIMatch] = []
+    for candidate in _CONTEXT_PERSON.finditer(text):
+        start, end = candidate.span("value")
+        if _overlaps(start, end, covered):
+            continue
+        # Natasha может не вернуть PER после маскирования соседних полей. Сам
+        # fallback всё равно остаётся локальным: ровно три именных компонента
+        # после сильного персонального маркера.
+        confidence = 0.86 if not person_anchors else 0.92
+        recovered.append(
+            PIIMatch("PERSON", text[start:end], start, end, confidence, detector_name)
+        )
+    return recovered
 
 
 def _expand_place_left(text: str, start: int) -> int:
@@ -360,6 +478,10 @@ def _structured_address_bounds(
     if prefix is not None:
         start += prefix.end()
     end = components[right][1]
+    boundary = _ADDRESS_FIELD_BOUNDARY.search(text, address_end, end)
+    if boundary is not None:
+        end = boundary.start()
+    end = _trim_terminal_punctuation(text, start, end)
     if start >= end:
         return address_start, address_end
     return start, end
@@ -371,6 +493,20 @@ def _is_address_component(component: tuple[int, int, str]) -> bool:
         _ADDRESS_SERVICE_PREFIX.search(value) is not None
         or _STRUCTURED_ADDRESS_COMPONENT.search(value) is not None
     )
+
+
+def _trim_terminal_punctuation(text: str, start: int, end: int) -> int:
+    while end > start and text[end - 1].isspace():
+        end -= 1
+    while end > start and text[end - 1] in "!?;":
+        end -= 1
+    if end > start and text[end - 1] == ".":
+        token = re.search(r"(?iu)([а-яё]+)\.$", text[start:end])
+        if token is None or token.group(1).casefold() not in {
+            "г", "ул", "д", "кв", "обл", "корп", "стр", "пер",
+        }:
+            end -= 1
+    return end
 
 
 def _subtract_occupied(
@@ -393,29 +529,6 @@ def _subtract_occupied(
     if cursor < end:
         safe.append((cursor, end))
     return [(part_start, part_end) for part_start, part_end in safe if part_start < part_end]
-
-
-def _extend_issuer(text: str, start: int, end: int) -> int:
-    """Дочитывает название органа до конца оборота, не обрываясь на «г.»."""
-    index = end
-    length = len(text)
-    while index < length:
-        char = text[index]
-        if char.isalpha() or char in " \t-«»":
-            index += 1
-            continue
-        if char == "." and _abbreviation_dot(text, start, index):
-            index += 1
-            continue
-        break
-    return index
-
-
-def _abbreviation_dot(text: str, start: int, dot_index: int) -> bool:
-    cursor = dot_index - 1
-    while cursor >= start and text[cursor].isalpha():
-        cursor -= 1
-    return 1 <= dot_index - 1 - cursor <= 3
 
 
 def _consume_prefix(text: str, start: int, end: int, pattern: re.Pattern[str]) -> int:

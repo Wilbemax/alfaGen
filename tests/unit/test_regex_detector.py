@@ -434,3 +434,83 @@ async def test_overlap_resolution_happens_before_threshold(regex_detector):
     resolved = regex_detector._resolve_overlaps(matches)
     assert [match.entity_type for match in resolved] == ["PASSPORT"]
     assert [match for match in resolved if match.confidence >= regex_detector.config.confidence_threshold] == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "source,value",
+    [
+        ("Год рождения указан как 1987-06-05", "1987-06-05"),
+        ("Birth date: 03/27/1993", "03/27/1993"),
+        ("Дата рождения — 07. 09. 1986", "07. 09. 1986"),
+    ],
+)
+async def test_birth_context_variants_keep_exact_offsets(regex_detector, source, value):
+    matches = await regex_detector.detect(source)
+    match = next(item for item in matches if item.entity_type == "DATE_OF_BIRTH")
+    assert (match.start, match.end, match.text) == (
+        source.index(value),
+        source.index(value) + len(value),
+        value,
+    )
+    assert source[match.start:match.end] == match.text
+
+
+@pytest.mark.asyncio
+async def test_citizenship_allows_local_field_qualifier(regex_detector):
+    source = "Гражданство клиента: Республика Беларусь"
+    value = "Республика Беларусь"
+    matches = await regex_detector.detect(source)
+    match = next(item for item in matches if item.entity_type == "CITIZENSHIP")
+    assert match.text == value
+    assert (match.start, match.end) == (source.index(value), len(source))
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "source,value",
+    [
+        ("cardholder\nNIKOLAY PETROV\n", "NIKOLAY PETROV"),
+        ("Имя держателя: ELENA SOKOLOVA.", "ELENA SOKOLOVA"),
+        ("holder ROMAN BELOV pin-code 3142", "ROMAN BELOV"),
+    ],
+)
+async def test_card_holder_field_boundaries(regex_detector, source, value):
+    matches = await regex_detector.detect(source)
+    match = next(item for item in matches if item.entity_type == "CARD_HOLDER")
+    assert match.text == value
+    assert source[match.start:match.end] == value
+
+
+@pytest.mark.asyncio
+async def test_driver_context_beats_generic_number_label(regex_detector):
+    source = "Номер: водительское удостоверение 51 07 123456"
+    matches = await regex_detector.detect(source)
+    assert [(item.entity_type, item.text) for item in matches] == [
+        ("DRIVER_LICENSE", "51 07 123456")
+    ]
+
+
+@pytest.mark.asyncio
+async def test_department_code_accepts_line_break_and_tab(regex_detector):
+    source = "код подразделения\n\t654-321"
+    matches = await regex_detector.detect(source)
+    match = next(item for item in matches if item.entity_type == "PASSPORT_DEPT_CODE")
+    assert match.text == "654-321"
+    assert source[match.start:match.end] == match.text
+
+
+@pytest.mark.asyncio
+async def test_unlabelled_technical_numbers_are_not_inn(regex_detector):
+    matches = await regex_detector.detect(
+        "Идентификаторы операции 4510666777 и сессии 123456789012"
+    )
+    assert not any(item.entity_type == "INN" for item in matches)
+
+
+@pytest.mark.asyncio
+async def test_negative_passport_phrase_does_not_supply_context(regex_detector):
+    matches = await regex_detector.detect(
+        "Заказ 4510 223344 без слова паспорт не является документом"
+    )
+    assert not any(item.entity_type == "PASSPORT" for item in matches)

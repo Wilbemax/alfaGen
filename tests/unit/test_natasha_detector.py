@@ -422,3 +422,109 @@ async def test_organization_without_issuer_context_is_dropped() -> None:
     await detector.initialize()
 
     assert await detector.detect(text) == []
+
+
+@pytest.mark.asyncio
+async def test_address_excludes_field_label_and_terminal_punctuation() -> None:
+    text = (
+        "Адрес регистрации: Россия, 443000, г. Самара, ул. Молодогвардейская, "
+        "д. 12, кв. 8."
+    )
+    value = text.removeprefix("Адрес регистрации: ").removesuffix(".")
+    city = "Самара"
+    city_start = text.index(city)
+    detector = NatashaDetector(
+        ner_runner=_runner([(city_start, city_start + len(city), "LOC", 0.9)])
+    )
+    await detector.initialize()
+
+    matches = await detector.detect(text)
+
+    assert [(item.entity_type, item.text) for item in matches] == [("ADDRESS", value)]
+    assert matches[0].start == text.index(value)
+    assert matches[0].end == text.index(value) + len(value)
+
+
+@pytest.mark.asyncio
+async def test_address_stops_before_passport_field() -> None:
+    text = "проживает: Россия, 300000, г. Тула, ул. Советская, д. 3 паспорт 4510 223344"
+    value = "Россия, 300000, г. Тула, ул. Советская, д. 3"
+    city_start = text.index("Тула")
+    passport_start = text.index("4510 223344")
+    detector = NatashaDetector(
+        ner_runner=_runner([(city_start, city_start + 4, "LOC", 0.9)])
+    )
+    await detector.initialize()
+
+    matches = await detector.detect(
+        text, occupied=[(passport_start, passport_start + len("4510 223344"))]
+    )
+
+    assert [(item.entity_type, item.text) for item in matches] == [("ADDRESS", value)]
+
+
+@pytest.mark.asyncio
+async def test_issuer_stops_before_following_fields() -> None:
+    text = "Орган: ОВД района Заречный код подразделения 654-321 гражданство РФ"
+    issuer = "ОВД района Заречный"
+    start = text.index("ОВД")
+    detector = NatashaDetector(
+        ner_runner=_runner([(start, start + 3, "ORG", 0.9)])
+    )
+    await detector.initialize()
+
+    matches = await detector.detect(text)
+
+    assert [(item.entity_type, item.text) for item in matches] == [
+        ("PASSPORT_ISSUER", issuer)
+    ]
+    assert text[matches[0].start:matches[0].end] == issuer
+
+
+@pytest.mark.asyncio
+async def test_issuer_keeps_city_abbreviation_and_drops_sentence_dot() -> None:
+    text = "Кем выдан: УФМС России по г. Курску. Следующее поле пусто."
+    issuer = "УФМС России по г. Курску"
+    start = text.index("УФМС")
+    detector = NatashaDetector(
+        ner_runner=_runner([(start, start + len("УФМС"), "ORG", 0.9)])
+    )
+    await detector.initialize()
+
+    matches = await detector.detect(text)
+
+    assert [(item.entity_type, item.text) for item in matches] == [
+        ("PASSPORT_ISSUER", issuer)
+    ]
+
+
+@pytest.mark.asyncio
+async def test_partial_person_anchor_expands_to_three_components() -> None:
+    text = "на имя\tСидорова   Елена Викторовна"
+    anchor = "Елена Викторовна"
+    start = text.index(anchor)
+    full_name = "Сидорова   Елена Викторовна"
+    detector = NatashaDetector(
+        ner_runner=_runner([(start, start + len(anchor), "PER", 0.9)])
+    )
+    await detector.initialize()
+
+    matches = await detector.detect(text)
+
+    assert [(item.entity_type, item.text) for item in matches] == [
+        ("PERSON", full_name)
+    ]
+    assert text[matches[0].start:matches[0].end] == full_name
+
+
+@pytest.mark.asyncio
+async def test_context_person_fallback_is_limited_to_three_name_parts() -> None:
+    detector = NatashaDetector(ner_runner=_runner([]))
+    await detector.initialize()
+
+    positive = "Заявитель Воронов Артем Ильич подписал форму"
+    positive_matches = await detector.detect(positive)
+    assert [(item.entity_type, item.text) for item in positive_matches] == [
+        ("PERSON", "Воронов Артем Ильич")
+    ]
+    assert await detector.detect("Произвольные Русские Слова встретились здесь") == []

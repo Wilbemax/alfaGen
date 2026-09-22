@@ -18,7 +18,8 @@ class RegexDetector(BaseDetector):
 
     _CONTEXT_RADIUS = 40
     _DATE = re.compile(
-        r"(?<!\d)(?:(?:0?[1-9]|[12]\d|3[01])[./](?:0?[1-9]|1[0-2])[./](?:19|20)\d{2}"
+        r"(?<!\d)(?:(?:0?[1-9]|[12]\d|3[01])\.\s*(?:0?[1-9]|1[0-2])\.\s*(?:19|20)\d{2}"
+        r"|(?:0?[1-9]|[12]\d|3[01])/(?:0?[1-9]|1[0-2])/(?:19|20)\d{2}"
         r"|(?:0?[1-9]|1[0-2])/(?:0?[1-9]|[12]\d|3[01])/(?:19|20)\d{2}"
         r"|(?:19|20)\d{2}-(?:0?[1-9]|1[0-2])-(?:0?[1-9]|[12]\d|3[01])"
         r"|(?:19|20)\d{2}\.(?:(?:0?[1-9]|1[0-2])\.(?:0?[1-9]|[12]\d|3[01])"
@@ -41,16 +42,18 @@ class RegexDetector(BaseDetector):
     )
     _CITIZENSHIP_VALUE = re.compile(
         r"(?iu)(?<![а-яёa-z])(?:гражданство|гражданин|гражданка)"
-        r"(?![а-яёa-z])[ \t]*(?:[:—-][ \t]*)?"
+        r"(?![а-яёa-z])(?:[ \t]+(?:заявителя|клиента))?"
+        r"[ \t]*(?:[:—-][ \t]*)?"
         r"(?P<value>рф|российск(?:ая|ой|ую)\s+федерац(?:ия|ии|ию)"
         r"|росси(?:я|и|ю)|казахстан(?:а)?|украин(?:а|ы|е|у)"
         r"|(?:республик(?:а|и|у)[ \t]+)?беларус(?:ь|и))"
         r"(?![а-яёa-z])"
     )
     _CARD_HOLDER_VALUE = re.compile(
-        r"(?iu)(?<![а-яёa-z])(?:держатель(?:[ \t]+карты)?|cardholder|holder)"
-        r"(?![а-яёa-z])[ \t]*(?:[:—-][ \t]*)?"
-        r"(?P<value>[a-z]+[ \t]+[a-z]+)(?![a-z]|[ \t]+[a-z])"
+        r"(?iu)(?<![а-яёa-z])(?:имя[ \t]+держателя|держатель(?:[ \t]+карты)?|cardholder|holder)"
+        r"(?![а-яёa-z])\s*(?:[:—-][ \t]*)?"
+        r"(?P<value>[a-z]+[ \t]+[a-z]+)"
+        r"(?=$|[\r\n.,;!?]|[ \t]+[а-яё]|[ \t]+(?:pin(?:[ -]?code)?|cvv2?|cvc2?)\b)"
     )
 
     _TYPE_SPECIFICITY: ClassVar[dict[str, int]] = {
@@ -122,8 +125,13 @@ class RegexDetector(BaseDetector):
                 ),
             ],
             "INN": [
-                (re.compile(r"(?<!\d)\d{12}(?!\d)"), 0.90),
-                (re.compile(r"(?<!\d)\d{10}(?!\d)"), 0.85),
+                (
+                    re.compile(
+                        r"(?iu)(?:\bинн\b|\bналогов(?:ый|ого)\s+номер\b)"
+                        r"[^\d]{0,20}(?P<value>\d{10}|\d{12})(?!\d)"
+                    ),
+                    0.90,
+                ),
             ],
             "BANK_CARD": [
                 (re.compile(r"(?<!\d)\d{4}(?:[ -]?\d{4}){3}(?!\d)"), 0.95),
@@ -148,7 +156,7 @@ class RegexDetector(BaseDetector):
             "PASSPORT_DEPT_CODE": [
                 (
                     re.compile(
-                        r"(?i)\bкод\s+подразделения\b[ \t:-]*"
+                        r"(?i)\bкод\s+подразделения\b\s*[:—-]?\s*"
                         r"(?P<value>\d{3}-\d{3})(?!\d)"
                     ),
                     0.95,
@@ -208,21 +216,13 @@ class RegexDetector(BaseDetector):
                 for split_start, split_end in split_ranges
             ):
                 continue
-            if self._has_context(
-                text,
-                start,
-                end,
-                ("паспорт", "серия", "номер"),
-            ):
+            if self._has_left_context(text, start, ("паспорт", "серия")):
                 found.append(self._make_match("PASSPORT", text, start, end, 0.96))
 
         for match in self._DRIVER_VALUE.finditer(text):
             start, end = match.span()
-            if self._has_context(
-                text,
-                start,
-                end,
-                ("водительское", "удостоверение", "права"),
+            if self._has_left_context(
+                text, start, ("водительское", "удостоверение", "права")
             ):
                 found.append(
                     self._make_match("DRIVER_LICENSE", text, start, end, 0.93)
@@ -240,8 +240,10 @@ class RegexDetector(BaseDetector):
                     before,
                 )
                 birth_context = re.search(
-                    r"(?:дата\s+рождения|родил(?:ся|ась))\W*$",
+                    r"(?:дата\s+рождения|год\s+рождения|birth\s+date|родил(?:ся|ась))"
+                    r"[^.!?;\r\n]{0,24}$",
                     before,
+                    re.IGNORECASE,
                 )
                 if issue_context:
                     entity_type = "PASSPORT_ISSUE_DATE"
@@ -266,7 +268,7 @@ class RegexDetector(BaseDetector):
             (
                 "CARD_HOLDER",
                 self._CARD_HOLDER_VALUE,
-                ("держатель", "cardholder", "holder"),
+                ("держатель", "держателя", "cardholder", "holder"),
                 0.95,
             ),
         )
@@ -314,6 +316,24 @@ class RegexDetector(BaseDetector):
             max(0, start - self._CONTEXT_RADIUS):
             min(len(text), end + self._CONTEXT_RADIUS)
         ].casefold()
+        return any(
+            re.search(
+                rf"(?<![а-яёa-z]){re.escape(keyword)}(?![а-яёa-z])",
+                context,
+            )
+            for keyword in keywords
+        )
+
+    def _has_left_context(
+        self,
+        text: str,
+        start: int,
+        keywords: Iterable[str],
+    ) -> bool:
+        """Проверяет только предшествующий локальный контекст значения."""
+        context = text[max(0, start - self._CONTEXT_RADIUS):start].casefold()
+        if re.search(r"\bбез\s+слова\s+паспорт\b", context):
+            return False
         return any(
             re.search(
                 rf"(?<![а-яёa-z]){re.escape(keyword)}(?![а-яёa-z])",

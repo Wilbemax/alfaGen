@@ -142,3 +142,41 @@ def test_trimming_with_multiple_spaces(context_filter: ContextFilter) -> None:
     assert result[0].start == 9
     assert result[0].end == 20
     assert result[0].text == text[result[0].start:result[0].end]
+
+
+def test_touching_spans_do_not_overlap(context_filter: ContextFilter) -> None:
+    text = "a@b.ru8(900)111-22-33"
+    email = _match("EMAIL", "a@b.ru", 0, 6)
+    phone = _match("PHONE", "8(900)111-22-33", 6, len(text))
+    result = context_filter.filter(text, [phone, email])
+    assert [(item.entity_type, item.start, item.end) for item in result] == [
+        ("EMAIL", 0, 6),
+        ("PHONE", 6, len(text)),
+    ]
+
+
+def test_invalid_source_span_is_removed(context_filter: ContextFilter) -> None:
+    text = "ИНН 7707083893"
+    invalid = _match("INN", "7707083892", 4, 14)
+    assert context_filter.filter(text, [invalid]) == []
+
+
+def test_person_trimming_preserves_tabs_and_multiple_spaces(
+    context_filter: ContextFilter,
+) -> None:
+    text = "клиент\tИванов   Петр"
+    person = _match("PERSON", text, 0, len(text))
+    result = context_filter.filter(text, [person])
+    assert len(result) == 1
+    assert result[0].text == "Иванов   Петр"
+    assert text[result[0].start:result[0].end] == result[0].text
+
+
+def test_passport_issuer_wins_only_its_overlap(context_filter: ContextFilter) -> None:
+    text = "ОВД района Северный, г. Томск"
+    issuer = _match("PASSPORT_ISSUER", "ОВД района Северный", 0, 19)
+    address = _match("ADDRESS", text, 0, len(text))
+    result = context_filter.filter(text, [address, issuer])
+    assert [(item.entity_type, item.text) for item in result] == [
+        ("PASSPORT_ISSUER", "ОВД района Северный")
+    ]
