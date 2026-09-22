@@ -3,7 +3,8 @@ from __future__ import annotations
 import bisect
 import logging
 import re
-from typing import ClassVar, Iterable
+from collections.abc import Iterable
+from typing import ClassVar
 
 from app.config.settings import pii_rules
 from app.detectors.base import BaseDetector, DetectorConfig
@@ -26,7 +27,7 @@ class RegexDetector(BaseDetector):
     _TEXT_DATE = re.compile(
         r"(?<!\d)(?:0?[1-9]|[12]\d|3[01])\s+"
         r"(?:января|февраля|марта|апреля|мая|июня|июля|августа|сентября|октября|ноября|декабря)\s+"
-        r"(?:19|20)\d{2}(?=\s+года?\b|\b)",
+        r"(?:19|20)\d{2}(?:\s+года?\b)?",
         re.IGNORECASE,
     )
     _PASSPORT_VALUE = re.compile(
