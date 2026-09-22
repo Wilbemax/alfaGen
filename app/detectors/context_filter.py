@@ -2,12 +2,9 @@ from __future__ import annotations
 
 import logging
 import re
-from typing import TYPE_CHECKING
 
 from app.config.settings import PIIRulesConfig, pii_rules
-
-if TYPE_CHECKING:
-    from app.models.pii import PIIMatch
+from app.models.pii import PIIMatch
 
 logger = logging.getLogger(__name__)
 
@@ -86,8 +83,11 @@ class ContextFilter:
         result: list["PIIMatch"] = []
         for m in matches:
             if m.entity_type == "PERSON":
-                if self._person_excluded(text, m, historical, service_words):
+                person_result = self._person_excluded(text, m, historical, service_words)
+                if person_result is True:
                     continue
+                if isinstance(person_result, PIIMatch):
+                    m = person_result
             elif m.entity_type in ("ADDRESS", "ADDRESS_PARTIAL"):
                 if self._address_excluded(text, m, bank_branches, bank_patterns):
                     continue
@@ -103,7 +103,7 @@ class ContextFilter:
         m: "PIIMatch",
         historical: set[str],
         service_words: set[str],
-    ) -> bool:
+    ) -> bool | PIIMatch:
         window = text[max(0, m.start - 40): min(len(text), m.end + 40)].lower()
         if any(h in window for h in historical):
             return True
@@ -132,7 +132,7 @@ class ContextFilter:
         if start_idx > 0 or end_idx < len(words):
             new_start = m.start + len(" ".join(words[:start_idx])) + (1 if start_idx > 0 else 0)
             new_end = m.end - len(" ".join(words[end_idx:])) - (1 if end_idx < len(words) else 0)
-            new_text = text[new_start:new_end]
+            new_text = " ".join(remaining)
             if len(new_text.split()) < 2:
                 return True
             m = PIIMatch(
@@ -144,6 +144,7 @@ class ContextFilter:
                 detector_name=m.detector_name,
                 metadata=m.metadata,
             )
+            return m
         return False
 
     def _address_excluded(
