@@ -1,10 +1,13 @@
-from enum import Enum
+from enum import StrEnum
 from typing import Annotated
 
-from pydantic import BaseModel, ConfigDict, Field, StringConstraints
+from pydantic import BaseModel, ConfigDict, Field, StringConstraints, field_validator
+
+from app.config.settings import settings
+from app.utils.tokenizer import count_tokens
 
 
-class PIIEntityType(str, Enum):
+class PIIEntityType(StrEnum):
     """Типы персональных данных"""
     PERSON = "PERSON"
     DATE_OF_BIRTH = "DATE_OF_BIRTH"
@@ -35,7 +38,7 @@ class ProcessRequest(BaseModel):
         extra="forbid",
     )
 
-    payload: Annotated[str, StringConstraints(max_length=100_000)] = Field(
+    payload: Annotated[str, StringConstraints(max_length=1_000_000)] = Field(
         ...,
         description="Строка для обработки. На прямом шаге — исходный текст с ПДн; "
         "на обратном шаге — ранее возвращённая замаскированная строка (тот же payload_id).",
@@ -46,6 +49,16 @@ class ProcessRequest(BaseModel):
         description="Идентификатор корреляции. Один и тот же для пары маскирование→демаскирование.",
         examples=["8a77d363c7c044b49b41d7b8a448243a"],
     )
+
+    @field_validator("payload")
+    @classmethod
+    def _validate_token_limit(cls, v: str) -> str:
+        """Лимит длины считается в токенах, а не в символах."""
+        if count_tokens(v) > settings.pipeline_max_text_length:
+            raise ValueError(
+                f"payload exceeds {settings.pipeline_max_text_length} tokens"
+            )
+        return v
 
 
 class ProcessResponse(BaseModel):

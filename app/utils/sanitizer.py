@@ -1,8 +1,9 @@
 from __future__ import annotations
+
 import logging
 import re
+from contextlib import suppress
 from typing import Any
-
 
 # Паттерны для обнаружения ПДн в логах
 PII_PATTERNS: list[re.Pattern] = [
@@ -39,10 +40,8 @@ class PIISanitizingFilter(logging.Filter):
         super().__init__()
         self._patterns = PII_PATTERNS
         if pii_patterns:
-            try:
+            with suppress(re.error):
                 self._patterns = [re.compile(p) for p in pii_patterns.split(",")]
-            except re.error:
-                pass
 
     def filter(self, record: logging.LogRecord) -> bool:
         """Санитизирует сообщение лога"""

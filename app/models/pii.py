@@ -13,7 +13,7 @@ class PIIMatch:
     detector_name: str
     metadata: dict[str, Any] = field(default_factory=dict)
 
-    def to_entity(self, token: str | None = None) -> "PIIEntity":
+    def to_entity(self, token: str | None = None) -> "PIIEntity":  # noqa: F821
         from app.models.request import PIIEntity, PIIEntityType
         # Если токен не передан явно, берем из metadata (если есть)
         resolved_token = token or self.metadata.get("token")

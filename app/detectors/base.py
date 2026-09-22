@@ -4,7 +4,6 @@ from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from app.models.pii import PIIMatch
-    from app.config.settings import settings as app_settings
 
 
 @dataclass(slots=True)

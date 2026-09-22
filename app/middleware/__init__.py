@@ -1,6 +1,6 @@
-from app.middleware.logging_middleware import RequestLoggingMiddleware, MetricsMiddleware
+from app.middleware.logging_middleware import MetricsMiddleware, RequestLoggingMiddleware
 
 __all__ = [
-    "RequestLoggingMiddleware",
     "MetricsMiddleware",
+    "RequestLoggingMiddleware",
 ]

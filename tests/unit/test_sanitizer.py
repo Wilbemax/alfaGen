@@ -1,6 +1,6 @@
 from __future__ import annotations
+
 import logging
-import pytest
 
 from app.utils.sanitizer import PIISanitizingFilter, sanitize_text
 

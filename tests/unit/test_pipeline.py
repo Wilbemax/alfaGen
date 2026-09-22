@@ -1,8 +1,9 @@
 from __future__ import annotations
+
 import pytest
 
-from app.core.pipeline import Pipeline
 from app.core.payload_store import payload_store
+from app.core.pipeline import Pipeline
 
 
 @pytest.fixture

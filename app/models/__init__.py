@@ -9,13 +9,11 @@ from app.models.request import (
 )
 
 __all__ = [
-    # Request/Response models
-    "PIIEntityType",
-    "ProcessRequest",
-    "PIIEntity",
-    "ProcessResponse",
     "ErrorResponse",
     "HealthResponse",
-    # PII internal models
+    "PIIEntity",
+    "PIIEntityType",
     "PIIMatch",
+    "ProcessRequest",
+    "ProcessResponse",
 ]

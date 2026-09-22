@@ -1,8 +1,9 @@
 from pathlib import Path
 from typing import Any
+
+import yaml
 from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
-import yaml
 
 
 class AppSettings(BaseSettings):

@@ -27,7 +27,7 @@ class PayloadRecord:
         }
 
     @classmethod
-    def from_dict(cls, data: dict) -> "PayloadRecord":
+    def from_dict(cls, data: dict) -> PayloadRecord:
         return cls(
             original_text=data["original"],
             masked_text=data["mask"],
@@ -94,9 +94,10 @@ class PayloadStore:
                     json.dumps(record.to_dict(), ensure_ascii=False),
                     ex=int(self._ttl),
                 )
-                return
             except Exception as e:
                 logger.warning(f"Redis payload store put failed, falling back to memory: {e}")
+            else:
+                return
         self._put_local(payload_id, record)
 
     async def get(self, payload_id: str) -> PayloadRecord | None:

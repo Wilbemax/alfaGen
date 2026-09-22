@@ -52,7 +52,7 @@ def setup_logging() -> None:
 
 def _json_formatter() -> logging.Formatter:
     try:
-        from pythonjsonlogger.jsonlogger import JsonFormatter
+        from pythonjsonlogger.json import JsonFormatter
 
         return JsonFormatter(
             "%(asctime)s %(levelname)s %(name)s %(message)s %(module)s %(funcName)s %(lineno)d",

@@ -9,6 +9,7 @@ default: &default
     - "PLACE_OF_BIRTH"   # Место рождения
     - "PASSPORT_SERIES"  # Серия паспорта
     - "PASSPORT_NUMBER"  # Номер паспорта
+    - "PASSPORT"         # Серия + номер паспорта одним спаном
     - "PASSPORT_ISSUER"  # Орган выдавший паспорт
     - "PASSPORT_DEPT_CODE" # Код подразделения
     - "PASSPORT_ISSUE_DATE" # Дата выдачи паспорта

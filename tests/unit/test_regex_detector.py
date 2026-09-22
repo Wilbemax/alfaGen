@@ -1,8 +1,9 @@
 from __future__ import annotations
+
 import pytest
 
-from app.detectors.regex_detector import RegexDetector
 from app.detectors.base import DetectorConfig
+from app.detectors.regex_detector import RegexDetector
 
 
 @pytest.fixture
@@ -90,3 +91,130 @@ async def test_detect_multiple_entities(regex_detector):
     text = "Иван Иванов, email: test@mail.ru, телефон: +7 999 123-45-67"
     matches = await regex_detector.detect(text)
     assert len(matches) >= 2
+
+
+@pytest.mark.asyncio
+async def test_detect_place_of_birth(regex_detector):
+    matches = await regex_detector.detect("Место рождения: г. Москва")
+    assert any(m.entity_type == "PLACE_OF_BIRTH" for m in matches)
+
+
+@pytest.mark.asyncio
+async def test_detect_passport_issuer(regex_detector):
+    matches = await regex_detector.detect("Орган выдавший паспорт: ОВД района Тверской")
+    assert any(m.entity_type == "PASSPORT_ISSUER" for m in matches)
+
+
+@pytest.mark.asyncio
+async def test_detect_person_case_insensitive(regex_detector):
+    matches = await regex_detector.detect("иванов иван иванович")
+    assert any(m.entity_type == "PERSON" for m in matches)
+
+
+@pytest.mark.asyncio
+async def test_detect_date_year_first(regex_detector):
+    matches = await regex_detector.detect("Дата рождения: 1990.05.12")
+    assert any(m.entity_type == "DATE_OF_BIRTH" for m in matches)
+
+
+@pytest.mark.asyncio
+async def test_detect_date_in_words(regex_detector):
+    matches = await regex_detector.detect("Дата рождения: 12 мая 1990 года")
+    assert any(m.entity_type == "DATE_OF_BIRTH" for m in matches)
+
+
+@pytest.mark.asyncio
+async def test_historical_person_not_masked(regex_detector):
+    matches = await regex_detector.detect("Александр Сергеевич Пушкин родился в 1799 году")
+    assert not any(m.entity_type == "PERSON" for m in matches)
+
+
+@pytest.mark.asyncio
+async def test_year_not_detected_as_passport(regex_detector):
+    matches = await regex_detector.detect("В 1990 году было 1000 человек")
+    assert not any(m.entity_type == "PASSPORT_SERIES" for m in matches)
+
+
+@pytest.mark.asyncio
+async def test_bank_branch_address_not_masked(regex_detector):
+    matches = await regex_detector.detect("Отделение Альфа-Банка: г. Москва, ул. Тверская, 10")
+    assert not any(m.entity_type in ("ADDRESS", "ADDRESS_PARTIAL") for m in matches)
+
+
+@pytest.mark.asyncio
+async def test_passport_series_number_phrasing(regex_detector):
+    # «серия ... номер ...» — слова-метки остаются, цифры — отдельные спаны
+    matches = await regex_detector.detect("Серия 4509 номер 123456")
+    assert any(m.entity_type == "PASSPORT_SERIES" for m in matches)
+    assert any(m.entity_type == "PASSPORT_NUMBER" for m in matches)
+
+
+@pytest.mark.asyncio
+async def test_passport_adjacent_one_span(regex_detector):
+    # Подряд идущие серия + номер — один составной спан
+    matches = await regex_detector.detect("паспорт 4509 123456")
+    assert any(m.entity_type == "PASSPORT" for m in matches)
+    passport = next(m for m in matches if m.entity_type == "PASSPORT")
+    assert passport.text == "4509 123456"
+
+
+@pytest.mark.asyncio
+async def test_detect_driver_license_two_digit_series(regex_detector):
+    matches = await regex_detector.detect("Водительское удостоверение 77 123456")
+    assert any(m.entity_type == "DRIVER_LICENSE" for m in matches)
+
+
+@pytest.mark.asyncio
+async def test_citizenship_not_person(regex_detector):
+    matches = await regex_detector.detect("Гражданство: Российская Федерация")
+    assert not any(m.entity_type == "PERSON" for m in matches)
+
+
+@pytest.mark.asyncio
+async def test_cvv_span_is_value_only(regex_detector):
+    matches = await regex_detector.detect("CVV: 123")
+    cvv = next(m for m in matches if m.entity_type == "CARD_CVV")
+    assert cvv.text == "123"
+
+
+@pytest.mark.asyncio
+async def test_pin_span_is_value_only(regex_detector):
+    matches = await regex_detector.detect("Пин-код: 4321")
+    pin = next(m for m in matches if m.entity_type == "CARD_PIN")
+    assert pin.text == "4321"
+
+
+@pytest.mark.asyncio
+async def test_place_of_birth_span_is_value_only(regex_detector):
+    matches = await regex_detector.detect("Место рождения: г. Москва")
+    place = next(m for m in matches if m.entity_type == "PLACE_OF_BIRTH")
+    assert place.text == "г. Москва"
+
+
+@pytest.mark.asyncio
+async def test_passport_issuer_span_is_value_only(regex_detector):
+    matches = await regex_detector.detect("Орган выдавший паспорт: ОВД района Тверской")
+    issuer = next(m for m in matches if m.entity_type == "PASSPORT_ISSUER")
+    assert issuer.text == "ОВД района Тверской"
+
+
+@pytest.mark.asyncio
+async def test_passport_one_span(regex_detector):
+    matches = await regex_detector.detect("паспорт 4509 123456")
+    assert any(m.entity_type == "PASSPORT" for m in matches)
+    passport = next(m for m in matches if m.entity_type == "PASSPORT")
+    assert passport.text == "4509 123456"
+
+
+@pytest.mark.asyncio
+async def test_year_in_date_does_not_cancel_date(regex_detector):
+    matches = await regex_detector.detect("Дата рождения: 12.05.1990")
+    assert any(m.entity_type == "DATE_OF_BIRTH" for m in matches)
+    assert not any(m.entity_type == "PASSPORT_SERIES" for m in matches)
+
+
+@pytest.mark.asyncio
+async def test_card_digits_not_passport_series(regex_detector):
+    matches = await regex_detector.detect("Карта 4276 1234 5678 9012")
+    assert any(m.entity_type == "BANK_CARD" for m in matches)
+    assert not any(m.entity_type == "PASSPORT_SERIES" for m in matches)

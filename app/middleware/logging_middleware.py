@@ -1,4 +1,5 @@
 from __future__ import annotations
+
 import logging
 import time
 import uuid
@@ -8,7 +9,7 @@ from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
 from starlette.responses import Response
 
-from app.utils.sanitizer import sanitize_text
+from app.utils.metrics import observe_request
 
 if TYPE_CHECKING:
     from starlette.types import ASGIApp
@@ -22,7 +23,7 @@ class RequestLoggingMiddleware(BaseHTTPMiddleware):
     Гарантирует, что ПДн не попадут в логи.
     """
 
-    def __init__(self, app: "ASGIApp") -> None:
+    def __init__(self, app: ASGIApp) -> None:
         super().__init__(app)
         self._sensitive_paths = {"/process"}
 
@@ -60,8 +61,6 @@ class RequestLoggingMiddleware(BaseHTTPMiddleware):
                     "duration_ms": round(duration_ms, 2),
                 },
             )
-            return response
-
         except Exception:
             duration_ms = (time.monotonic() - start_time) * 1000
             # Не логируем текст исключения — он может содержать ПДн.
@@ -75,44 +74,15 @@ class RequestLoggingMiddleware(BaseHTTPMiddleware):
                 },
             )
             raise
+        else:
+            return response
 
 
 class MetricsMiddleware(BaseHTTPMiddleware):
-    """Middleware для сбора метрик Prometheus"""
+    """Middleware для сбора метрик Prometheus (latency, RPS)."""
 
-    def __init__(self, app: "ASGIApp") -> None:
+    def __init__(self, app: ASGIApp) -> None:
         super().__init__(app)
-        self._init_metrics()
-
-    def _init_metrics(self) -> None:
-        from prometheus_client import Counter, Histogram
-
-        self.requests_total = Counter(
-            "pii_gateway_requests_total",
-            "Total requests",
-            ["method", "path", "status"],
-        )
-        self.request_duration = Histogram(
-            "pii_gateway_request_duration_seconds",
-            "Request duration in seconds",
-            ["method", "path"],
-            buckets=(0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0),
-        )
-        self.entities_detected = Counter(
-            "pii_gateway_entities_detected_total",
-            "Total PII entities detected",
-            ["entity_type"],
-        )
-        self.llm_requests = Counter(
-            "pii_gateway_llm_requests_total",
-            "Total LLM requests",
-            ["status"],
-        )
-        self.llm_duration = Histogram(
-            "pii_gateway_llm_duration_seconds",
-            "LLM request duration in seconds",
-            buckets=(0.1, 0.5, 1.0, 2.5, 5.0, 10.0, 20.0, 30.0),
-        )
 
     async def dispatch(self, request: Request, call_next) -> Response:
         path = request.url.path
@@ -126,11 +96,10 @@ class MetricsMiddleware(BaseHTTPMiddleware):
         try:
             response = await call_next(request)
             duration = time.monotonic() - start_time
-            self.requests_total.labels(method=method, path=path, status=str(response.status_code)).inc()
-            self.request_duration.labels(method=method, path=path).observe(duration)
-            return response
+            observe_request(method, path, response.status_code, duration)
         except Exception:
             duration = time.monotonic() - start_time
-            self.requests_total.labels(method=method, path=path, status="500").inc()
-            self.request_duration.labels(method=method, path=path).observe(duration)
+            observe_request(method, path, 500, duration)
             raise
+        else:
+            return response

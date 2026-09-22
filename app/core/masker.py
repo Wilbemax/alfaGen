@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass, field
+from typing import ClassVar
 
 from app.models.pii import PIIMatch
 
@@ -107,6 +108,21 @@ class Masker:
             return self._mask_all(original)
         return original[:keep_start] + "*" * (length - keep_start - keep_end) + original[length - keep_end :]
 
+    def _mask_passport(self, original: str) -> str:
+        """Паспорт → сохраняем первые 2 и последние 2 цифры: «4509 123456» → «45******56»"""
+        digits = re.findall(r"\d", original)
+        if not digits:
+            return self._mask_all(original)
+        keep_start = min(2, len(digits))
+        keep_end = min(2, len(digits) - keep_start)
+        result = []
+        for i, d in enumerate(digits):
+            if i < keep_start or i >= len(digits) - keep_end:
+                result.append(d)
+            else:
+                result.append("*")
+        return "".join(result)
+
     def _mask_email(self, original: str) -> str:
         """Email → сохраняем первую букву и домен: «ivan.ivanov@example.com» → «i***@example.com»"""
         at = original.find("@")
@@ -188,9 +204,10 @@ class Masker:
         return re.sub(r"\d", "*", original)
 
     # Маппинг типов ПДн на методы маскирования
-    _maskers: dict[str, str] = {
+    _maskers: ClassVar[dict[str, str]] = {
         "PERSON": "_mask_initials",
         "CARD_HOLDER": "_mask_initials",
+        "PASSPORT": "_mask_passport",
         "PASSPORT_SERIES": "_mask_keep_edges_series",
         "PASSPORT_NUMBER": "_mask_keep_edges_number",
         "DRIVER_LICENSE": "_mask_keep_edges",

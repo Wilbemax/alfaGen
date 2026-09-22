@@ -110,10 +110,10 @@ async def process_request(
     """
     request_id = getattr(http_request.state, "request_id", "unknown")
 
-    # Rate limiting
-    allowed = await rate_limiter.check(
-        key=f"{request.payload_id}:{http_request.client.host if http_request.client else 'unknown'}",
-    )
+    # Rate limiting по клиенту (host), чтобы один клиент держал 1000 RPS.
+    # 429 с Retry-After отдаётся только при реальной перегрузке.
+    client_key = http_request.client.host if http_request.client else "unknown"
+    allowed = await rate_limiter.check(key=client_key)
     if not allowed:
         raise HTTPException(
             status_code=429,
@@ -139,7 +139,7 @@ async def process_request(
                 message="Internal processing error",
                 request_id=request_id,
             ).model_dump(),
-        )
+        ) from None
 
     except Exception:
         # Не логируем текст исключения — он может содержать ПДн.
@@ -151,7 +151,7 @@ async def process_request(
                 message="Internal server error",
                 request_id=request_id,
             ).model_dump(),
-        )
+        ) from None
 
 
 @app.exception_handler(HTTPException)

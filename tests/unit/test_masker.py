@@ -1,4 +1,5 @@
 from __future__ import annotations
+
 import pytest
 
 from app.core.masker import Masker
@@ -34,7 +35,14 @@ def test_mask_multiple_entities(masker):
     entities = [
         PIIMatch(entity_type="PERSON", text="Иван Иванов", start=0, end=11, confidence=0.9, detector_name="natasha"),
         PIIMatch(entity_type="EMAIL", text="test@mail.ru", start=20, end=32, confidence=0.98, detector_name="regex"),
-        PIIMatch(entity_type="PHONE", text="+7 999 123-45-67", start=43, end=60, confidence=0.95, detector_name="regex"),
+        PIIMatch(
+            entity_type="PHONE",
+            text="+7 999 123-45-67",
+            start=43,
+            end=60,
+            confidence=0.95,
+            detector_name="regex",
+        ),
     ]
     result = masker.mask(text, entities)
     assert "test@mail.ru" not in result.masked_text
@@ -69,7 +77,14 @@ def test_unmask_empty_spans(masker):
 def test_mask_person_initials(masker):
     text = "Клиент Иванов Иван Иванович"
     entities = [
-        PIIMatch(entity_type="PERSON", text="Иванов Иван Иванович", start=7, end=27, confidence=0.95, detector_name="regex"),
+        PIIMatch(
+            entity_type="PERSON",
+            text="Иванов Иван Иванович",
+            start=7,
+            end=27,
+            confidence=0.95,
+            detector_name="regex",
+        ),
     ]
     result = masker.mask(text, entities)
     assert "Иванов Иван Иванович" not in result.masked_text
@@ -92,7 +107,14 @@ def test_mask_passport_partial(masker):
 def test_mask_email_partial(masker):
     text = "email: ivan.ivanov@example.com"
     entities = [
-        PIIMatch(entity_type="EMAIL", text="ivan.ivanov@example.com", start=7, end=30, confidence=0.98, detector_name="regex"),
+        PIIMatch(
+            entity_type="EMAIL",
+            text="ivan.ivanov@example.com",
+            start=7,
+            end=30,
+            confidence=0.98,
+            detector_name="regex",
+        ),
     ]
     result = masker.mask(text, entities)
     assert "ivan.ivanov@example.com" not in result.masked_text
