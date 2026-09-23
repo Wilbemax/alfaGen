@@ -7,11 +7,11 @@ services:
       dockerfile: docker/Dockerfile
     container_name: pii-gateway-api
     ports:
-      - "8000:8000"
+      - "${API_HOST_PORT:-8000}:8000"
     environment:
       - APP_HOST=0.0.0.0
       - APP_PORT=8000
-      - UVICORN_WORKERS=${UVICORN_WORKERS:-4}
+      - UVICORN_WORKERS=${UVICORN_WORKERS:-6}
       - LOG_LEVEL=INFO
       - LOG_FORMAT=json
       - LLM_API_KEY=${LLM_API_KEY}
@@ -46,8 +46,6 @@ services:
     image: redis:7-alpine
     container_name: pii-gateway-redis
     command: redis-server --appendonly yes --maxmemory 1gb --maxmemory-policy noeviction
-    ports:
-      - "6379:6379"
     volumes:
       - redis_data:/data
     healthcheck:

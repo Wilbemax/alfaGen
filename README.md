@@ -175,6 +175,34 @@ python scripts/load_check.py \
   --strict
 ```
 
+Для server-only проверки внутри Docker network генератор нужно запускать
+отдельно от published-port path. Один Python/httpx event loop сам становится
+ограничением около 1000 HTTP RPS, поэтому sustained-профиль запускается двумя
+равными shard-ами. Каждый shard выполняет полный MASK→DEMASK roundtrip; итоговые
+roundtrip/HTTP RPS и счётчики суммируются, а latency сравнивается по худшему
+shard-у:
+
+```bash
+for shard in a b; do
+  docker run --rm --name "pii-loadgen-$shard" \
+    --network docker_default \
+    -v "$PWD:/work:ro" -w /work docker-api \
+    python scripts/load_check.py \
+      --base-url http://api:8000 \
+      --rps 260 \
+      --duration 300 \
+      --concurrency 128 \
+      --max-connections 4 \
+      --max-keepalive-connections 4 \
+      --strict &
+done
+wait
+```
+
+Это отдельная метрика `DOCKER-INTERNAL`; её нельзя смешивать с результатом
+host→published-port. Для stretch 1000 roundtrip RPS использовались четыре
+shard-а по 255 target RT RPS с теми же payload и endpoint.
+
 PASS с флагом `--strict` требует фактический completed RPS и p95 latency, ноль расхождений демаскирования, ноль финальных 429/5xx и валидный JSON `{result}`.
 
 > **1000 RPS считается достигнутым только при прохождении strict gate с printed report.** Цифра 2000 RPS не публикуется как достигнутая, пока конкретный strict-отчёт этого не показал.
