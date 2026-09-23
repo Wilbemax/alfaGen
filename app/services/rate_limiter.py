@@ -25,6 +25,11 @@ class RateLimiter:
         self.burst = settings.rate_limit_burst
         self.key_prefix = settings.rate_limit_key_prefix
         self._local_buckets: dict[str, tuple[float, float]] = {}  # key -> (tokens, last_refill)
+        # Гигиена локального кэша: сколько запросов обрабатываем локально
+        # между синхронизациями с Redis. Снижает накладные расходы на Redis
+        # round-trip при сохранении общего состояния между воркерами.
+        self._local_sync_interval = 16
+        self._local_sync_counters: dict[str, int] = {}
 
     async def initialize(self) -> None:
         """Инициализация Redis подключения"""
@@ -40,6 +45,7 @@ class RateLimiter:
                 password=settings.redis_password,
                 socket_timeout=settings.redis_socket_timeout,
                 socket_connect_timeout=settings.redis_socket_connect_timeout,
+                max_connections=settings.redis_max_connections,
                 decode_responses=True,
             )
             # Проверяем подключение
@@ -66,9 +72,26 @@ class RateLimiter:
         bucket_key = f"{self.key_prefix}{key}"
 
         if self._redis:
-            return await self._check_redis(bucket_key, rate)
+            return await self._check_hybrid(bucket_key, rate)
         else:
             return self._check_local(bucket_key, rate)
+
+    async def _check_hybrid(self, key: str, rate: int) -> bool:
+        """Гибридный token bucket: локальный кэш + периодическая синхронизация с Redis.
+
+        Большинство запросов обслуживаются из локального кэша (без Redis
+        round-trip). Каждые ``_local_sync_interval`` запросов для ключа
+        синхронизируемся с Redis, чтобы не расходиться с другими воркерами.
+        """
+        assert self._redis is not None
+
+        counter = self._local_sync_counters.get(key, 0)
+        if counter >= self._local_sync_interval:
+            self._local_sync_counters[key] = 0
+            return await self._check_redis(key, rate)
+
+        self._local_sync_counters[key] = counter + 1
+        return self._check_local(key, rate)
 
     async def _check_redis(self, key: str, rate: int) -> bool:
         """Redis-based token bucket с Lua скриптом для атомарности"""

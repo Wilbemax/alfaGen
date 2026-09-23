@@ -49,6 +49,18 @@ class RegexDetector(BaseDetector):
         r"|(?:республик(?:а|и|у)[ \t]+)?беларус(?:ь|и))"
         r"(?![а-яёa-z])"
     )
+    _BIRTH_YEAR_MAX = 2012
+    _ISSUER_VALUE = re.compile(
+        r"(?iu)(?<![а-яёa-z])(?:о?уфмс|овд|мвд)"
+        r"(?:\s+россии)?"
+        r"(?:"
+        r"\s+по\s+(?:(?:г\.\s*|городу\s+|республике\s+)[а-яё][а-яё-]+|[а-яё][а-яё-]+)"
+        r"|\s+(?:района|города)\s+[а-яё][а-яё-]+"
+        r")"
+    )
+    _NAME_WORD = re.compile(r"(?iu)[а-яё]{2,}(?:-[а-яё]{2,})*")
+    _PATRONYMIC = re.compile(r"(?iu)(?:ович|евич|овна|евна|ична|инична)$")
+    _YEAR = re.compile(r"(?:19|20)\d{2}")
     _CARD_HOLDER_VALUE = re.compile(
         r"(?iu)(?<![а-яёa-z])(?:имя[ \t]+держателя|держатель(?:[ \t]+карты)?|cardholder|holder)"
         r"(?![а-яёa-z])\s*(?:[:—-][ \t]*)?"
@@ -90,6 +102,8 @@ class RegexDetector(BaseDetector):
             "PASSPORT_ISSUE_DATE",
             "CITIZENSHIP",
             "CARD_HOLDER",
+            "PERSON",
+            "PASSPORT_ISSUER",
         }
 
     async def initialize(self) -> None:
@@ -172,6 +186,8 @@ class RegexDetector(BaseDetector):
         matches.extend(self._detect_documents(text))
         matches.extend(self._detect_dates(text))
         matches.extend(self._detect_contextual_values(text))
+        matches.extend(self._detect_names(text))
+        matches.extend(self._detect_issuers(text))
 
         enabled = [match for match in matches if self._is_enabled(match.entity_type)]
         deduplicated = list(
@@ -247,7 +263,7 @@ class RegexDetector(BaseDetector):
                 )
                 if issue_context:
                     entity_type = "PASSPORT_ISSUE_DATE"
-                elif birth_context:
+                elif birth_context or self._birth_year(match.group()):
                     entity_type = "DATE_OF_BIRTH"
                 else:
                     continue
@@ -284,6 +300,42 @@ class RegexDetector(BaseDetector):
                         self._make_match(entity_type, text, start, end, confidence)
                     )
         return found
+
+    def _detect_names(self, text: str) -> list[PIIMatch]:
+        """Три соседних слова, если одно из них — отчество. Регистр не важен."""
+        words = list(self._NAME_WORD.finditer(text))
+        found: list[PIIMatch] = []
+        index = 0
+        while index + 2 < len(words):
+            window = words[index:index + 3]
+            gaps_are_spaces = all(
+                text[window[pos].end():window[pos + 1].start()].isspace()
+                for pos in range(2)
+            )
+            has_patronymic = any(self._PATRONYMIC.search(word.group()) for word in window)
+            if gaps_are_spaces and has_patronymic:
+                found.append(
+                    self._make_match("PERSON", text, window[0].start(), window[2].end(), 0.9)
+                )
+                index += 3
+            else:
+                index += 1
+        return found
+
+    def _detect_issuers(self, text: str) -> list[PIIMatch]:
+        """Орган выдачи по ОУФМС, УФМС, ОВД или МВД, без обязательного «выдан»."""
+        return [
+            self._make_match("PASSPORT_ISSUER", text, match.start(), match.end(), 0.93)
+            for match in self._ISSUER_VALUE.finditer(text)
+        ]
+
+    @classmethod
+    def _birth_year(cls, value: str) -> bool:
+        """Год в диапазоне рождения, если рядом нет слов о выдаче паспорта."""
+        matched = cls._YEAR.search(value)
+        if matched is None:
+            return False
+        return int(matched.group()) <= cls._BIRTH_YEAR_MAX
 
     def _make_match(
         self,

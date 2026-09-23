@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 import re
@@ -152,7 +153,9 @@ class NatashaDetector(BaseDetector):
         if deadline_monotonic is not None and time.monotonic() >= deadline_monotonic:
             return []
         try:
-            raw_spans = self._ner_runner(prepared)
+            # Natasha NER — CPU-bound и блокирует event loop. Выполняем в
+            # отдельном потоке, чтобы не сериализовать все запросы под нагрузкой.
+            raw_spans = await asyncio.to_thread(self._ner_runner, prepared)
         except Exception:
             logger.warning("Natasha NER failed, entities omitted")
             return []

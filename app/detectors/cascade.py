@@ -65,15 +65,21 @@ class CascadeDetector:
         self,
         text: str,
         allowed_types: set[str] | None = None,
-    ) -> list["PIIMatch"]:
+    ) -> list[PIIMatch]:
         """Детекция через каскад с фильтрацией по типам."""
         start = time.monotonic()
 
         regex_matches = await self._regex.detect(text)
         occupied = [(m.start, m.end) for m in regex_matches]
 
-        natasha_matches: list["PIIMatch"] = []
-        if self._natasha_available and self._natasha is not None:
+        natasha_matches: list[PIIMatch] = []
+        # Полный NER на сотнях тысяч символов не укладывается в SLA.
+        # На длинном тексте остаются линейные regex-правила.
+        if (
+            self._natasha_available
+            and self._natasha is not None
+            and len(text) <= settings.natasha_max_chars
+        ):
             try:
                 natasha_matches = await self._natasha.detect(
                     text,

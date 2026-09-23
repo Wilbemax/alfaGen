@@ -122,6 +122,10 @@ class LoadConfig:
     max_connections: int | None = None
     max_keepalive_connections: int | None = None
     strict: bool = False
+    # Отдельный concurrency для demask-фазы. Demask обрабатывает все сохранённые
+    # payload_id разом (burst), и слишком высокий concurrency перегружает сервер,
+    # ухудшая p95. По умолчанию равен concurrency, но может быть задан ниже.
+    demask_concurrency: int | None = None
 
 
 @dataclass(slots=True)
@@ -406,22 +410,33 @@ async def _execute(
     ) as client:
         phase_started = clock.monotonic()
         slot_count = planned_slot_count(config.duration, config.rps)
-        tasks: list[asyncio.Task[tuple[Outcome, float, str, str]]] = []
+        worker_count = max(config.concurrency, 1)
+        queue: asyncio.Queue[int] = asyncio.Queue()
+        results: list[tuple[Outcome, float, str, str]] = []
 
-        async def launch(index: int) -> tuple[Outcome, float, str, str]:
-            report.mask_logical_started += 1
-            payload = SYNTHETIC_PAYLOADS[index % len(SYNTHETIC_PAYLOADS)]
-            payload_id = uuid.uuid4().hex
-            outcome, latency = await _occupy(
-                client,
-                clock,
-                state,
-                semaphore,
-                payload,
-                payload_id,
-                config.timeout,
-            )
-            return outcome, latency, payload_id, payload
+        async def worker() -> None:
+            while True:
+                index = await queue.get()
+                try:
+                    if state.stop:
+                        continue
+                    report.mask_logical_started += 1
+                    payload = SYNTHETIC_PAYLOADS[index % len(SYNTHETIC_PAYLOADS)]
+                    payload_id = uuid.uuid4().hex
+                    outcome, latency = await _occupy(
+                        client,
+                        clock,
+                        state,
+                        semaphore,
+                        payload,
+                        payload_id,
+                        config.timeout,
+                    )
+                    results.append((outcome, latency, payload_id, payload))
+                finally:
+                    queue.task_done()
+
+        workers = [asyncio.create_task(worker()) for _ in range(worker_count)]
 
         for index in range(slot_count):
             if state.stop:
@@ -432,15 +447,15 @@ async def _execute(
                 await clock.sleep(delay)
             if state.stop:
                 break
-            await semaphore.acquire()
-            if state.stop:
-                semaphore.release()
-                break
             report.mask_logical_scheduled += 1
-            tasks.append(asyncio.create_task(launch(index)))
+            await queue.put(index)
+
+        await queue.join()
+        for w in workers:
+            w.cancel()
+        await asyncio.gather(*workers, return_exceptions=True)
 
         schedule_elapsed = max(clock.monotonic() - phase_started, 0.0)
-        results = await asyncio.gather(*tasks) if tasks else []
         mask_completed = len(results)
         mask_elapsed = max(clock.monotonic() - phase_started, 1e-9)
         report.scheduling_rps = report.mask_logical_scheduled / max(schedule_elapsed, 1e-9)
@@ -461,11 +476,13 @@ async def _execute(
                     mask_latencies.append(latency)
 
         if not state.stop:
+            demask_conc = config.demask_concurrency or config.concurrency
+            demask_semaphore = asyncio.Semaphore(max(demask_conc, 1))
             demask_latencies, mismatches = await _demask_phase(
                 client,
                 clock,
                 state,
-                semaphore,
+                demask_semaphore,
                 config,
                 report,
                 saved,
@@ -546,43 +563,52 @@ async def _demask_phase(
     latencies: list[float] = []
     mismatches = 0
 
-    tasks: list[asyncio.Task[None]] = []
+    worker_count = max(config.demask_concurrency or config.concurrency, 1)
+    queue: asyncio.Queue[tuple[str, str, str]] = asyncio.Queue()
 
-    async def one(payload_id: str, masked: str, original: str) -> None:
+    async def worker() -> None:
         nonlocal mismatches
-        report.demask_logical_started += 1
-        outcome, latency = await _occupy(
-            client,
-            clock,
-            state,
-            semaphore,
-            masked,
-            payload_id,
-            config.timeout,
-        )
-        report.demask_logical_completed += 1
-        report.demask_http_attempts += outcome.attempts
-        latencies.append(latency)
-        if outcome.attempts > 1:
-            report.retried_requests += 1
-        if outcome.kind != "success" or outcome.body != original:
-            if outcome.kind != "success":
-                _count_failure(report, outcome, phase="demask")
-            mismatches += 1
-        else:
-            report.demask_success += 1
+        while True:
+            payload_id, masked, original = await queue.get()
+            try:
+                if state.stop:
+                    continue
+                report.demask_logical_started += 1
+                outcome, latency = await _occupy(
+                    client,
+                    clock,
+                    state,
+                    semaphore,
+                    masked,
+                    payload_id,
+                    config.timeout,
+                )
+                report.demask_logical_completed += 1
+                report.demask_http_attempts += outcome.attempts
+                latencies.append(latency)
+                if outcome.attempts > 1:
+                    report.retried_requests += 1
+                if outcome.kind != "success" or outcome.body != original:
+                    if outcome.kind != "success":
+                        _count_failure(report, outcome, phase="demask")
+                    mismatches += 1
+                else:
+                    report.demask_success += 1
+            finally:
+                queue.task_done()
+
+    workers = [asyncio.create_task(worker()) for _ in range(worker_count)]
 
     for payload_id, masked, original in saved:
         if state.stop:
             break
-        await semaphore.acquire()
-        if state.stop:
-            semaphore.release()
-            break
         report.demask_logical_scheduled += 1
-        tasks.append(asyncio.create_task(one(payload_id, masked, original)))
-    if tasks:
-        await asyncio.gather(*tasks)
+        await queue.put((payload_id, masked, original))
+
+    await queue.join()
+    for w in workers:
+        w.cancel()
+    await asyncio.gather(*workers, return_exceptions=True)
     return latencies, mismatches
 
 
@@ -647,6 +673,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--timeout", type=float, default=10.0)
     parser.add_argument("--max-connections", type=int, default=None)
     parser.add_argument("--max-keepalive-connections", type=int, default=None)
+    parser.add_argument("--demask-concurrency", type=int, default=None,
+                        help="Concurrency for the demask phase (defaults to --concurrency)")
     parser.add_argument("--strict", action="store_true", help="Fail unless measured RPS and latency meet the gate")
     return parser.parse_args(argv)
 
@@ -661,6 +689,7 @@ def config_from_args(args: argparse.Namespace) -> LoadConfig:
         max_connections=args.max_connections,
         max_keepalive_connections=args.max_keepalive_connections,
         strict=args.strict,
+        demask_concurrency=args.demask_concurrency,
     )
 
 

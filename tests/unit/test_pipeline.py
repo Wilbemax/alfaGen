@@ -1,10 +1,14 @@
 from __future__ import annotations
 
+import asyncio
+import time
+
 import pytest
 
 from app.config.settings import settings
-from app.core.payload_store import payload_store
+from app.core.payload_store import MODE_MEMORY, PayloadStore, payload_store
 from app.core.pipeline import Pipeline, PipelineError
+from app.utils.tokenizer import count_tokens
 
 
 @pytest.fixture
@@ -150,3 +154,79 @@ async def test_payload_id_email_not_in_logs(pipeline, sample_text, caplog):
         await pipeline.process(sample_text, payload_id)
 
     assert "ivan@example.com" not in caplog.text
+
+
+class _GateStore(PayloadStore):
+    """Два первых чтения ждут друг друга, чтобы оба увидели пустое хранилище."""
+
+    def __init__(self) -> None:
+        super().__init__(ttl_seconds=50)
+        self.mode = MODE_MEMORY
+        self.ready = True
+        self._arrived = 0
+        self._release = asyncio.Event()
+
+    async def get(self, scope: str, payload_id: str):
+        self._arrived += 1
+        if self._arrived == 2:
+            self._release.set()
+        if self._arrived <= 2:
+            await self._release.wait()
+        return await super().get(scope, payload_id)
+
+
+@pytest.mark.asyncio
+async def test_concurrent_put_returns_winner_mask() -> None:
+    """Проигравший SET NX не отдаёт собственную маску."""
+    store = _GateStore()
+
+    class _EmptyCascade:
+        async def detect(self, payload: str, allowed_types=None):
+            return []
+
+    first = Pipeline(store=store)
+    second = Pipeline(store=store)
+    for item in (first, second):
+        item._initialized = True
+        item.cascade = _EmptyCascade()
+
+    left, right = await asyncio.gather(
+        first.process("первая строка", "same-id"),
+        second.process("вторая строка", "same-id"),
+    )
+    stored = await store.get("checker", "same-id")
+    assert stored is not None
+    assert left == right == stored.masked_text
+    assert {left, stored.original_text} <= {"первая строка", "вторая строка"}
+
+
+@pytest.mark.asyncio
+async def test_close_allows_next_initialize(monkeypatch) -> None:
+    monkeypatch.setattr(settings, "uvicorn_workers", 1)
+    monkeypatch.setattr(settings, "payload_store_key", "")
+    monkeypatch.setattr(settings, "payload_store_allow_memory_fallback", True)
+    store = PayloadStore()
+    item = Pipeline(store=store)
+    await item.initialize()
+    await item.close()
+    assert item._initialized is False
+    assert store.ready is False
+    await item.initialize()
+    assert item._initialized is True
+    assert store.ready is True
+    assert store.mode == MODE_MEMORY
+
+
+@pytest.mark.asyncio
+async def test_hundred_thousand_tokens_mask_under_one_second(pipeline) -> None:
+    """Длинный текст с несколькими десятками ПДн маскируется быстрее 1 с."""
+    phrase = "Клиент Иванов Иван Иванович, паспорт 4509 123456. "
+    text = phrase * 30 + ("заявка " * 95_000)
+    assert count_tokens(text) >= 90_000
+    started = time.perf_counter()
+    masked = await pipeline.process(text, "unit-large-1")
+    assert time.perf_counter() - started < 1.0
+    assert "Иванов Иван Иванович" not in masked
+    assert "4509 123456" not in masked
+    restored = await pipeline.process(masked, "unit-large-1")
+    assert restored == text
