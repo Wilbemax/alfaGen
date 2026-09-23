@@ -4,64 +4,29 @@ services:
       context: ..
       dockerfile: docker/Dockerfile
     container_name: pii-gateway-api
+    ports:
+      - "${API_HOST_PORT:-8000}:8000"
     environment:
-      APP_HOST: ${APP_HOST:-0.0.0.0}
-      APP_PORT: ${APP_PORT:-8000}
-
-      LLM_API_KEY: ${LLM_API_KEY:?LLM_API_KEY is required}
-      LLM_BASE_URL: ${LLM_BASE_URL:-https://api.deepseek.com}
-      LLM_MODEL: ${LLM_MODEL:-deepseek-chat}
-      LLM_TIMEOUT: ${LLM_TIMEOUT:-30}
-      LLM_MAX_RETRIES: ${LLM_MAX_RETRIES:-3}
-      LLM_RETRY_DELAY: ${LLM_RETRY_DELAY:-1}
-
-      LOG_LEVEL: ${LOG_LEVEL:-INFO}
-      LOG_FORMAT: ${LOG_FORMAT:-json}
-
-      PAYLOAD_STORE_KEY: ${PAYLOAD_STORE_KEY:?PAYLOAD_STORE_KEY is required}
-      PAYLOAD_STORE_TTL_SECONDS: ${PAYLOAD_STORE_TTL_SECONDS:-3600}
-      PAYLOAD_STORE_ALLOW_MEMORY_FALLBACK: ${PAYLOAD_STORE_ALLOW_MEMORY_FALLBACK:-false}
-
-      REDIS_HOST: ${REDIS_HOST:-redis}
-      REDIS_PORT: ${REDIS_PORT:-6379}
-      REDIS_DB: ${REDIS_DB:-0}
-      REDIS_PASSWORD: ${REDIS_PASSWORD:?REDIS_PASSWORD is required}
-      REDIS_MAX_CONNECTIONS: ${REDIS_MAX_CONNECTIONS:-100}
-      REDIS_SOCKET_TIMEOUT: ${REDIS_SOCKET_TIMEOUT:-0.2}
-      REDIS_SOCKET_CONNECT_TIMEOUT: ${REDIS_SOCKET_CONNECT_TIMEOUT:-0.2}
-
-      RATE_LIMIT_ENABLED: ${RATE_LIMIT_ENABLED:-true}
-      RATE_LIMIT_DEFAULT_RPS: ${RATE_LIMIT_DEFAULT_RPS:-1500}
-      RATE_LIMIT_BURST: ${RATE_LIMIT_BURST:-2000}
-      RATE_LIMIT_KEY_PREFIX: ${RATE_LIMIT_KEY_PREFIX:-pii_gateway:ratelimit:}
-
-      NATASHA_ENABLED: ${NATASHA_ENABLED:-true}
-      NATASHA_CONFIDENCE_THRESHOLD: ${NATASHA_CONFIDENCE_THRESHOLD:-0.85}
-
-      PRESIDIO_ENABLED: ${PRESIDIO_ENABLED:-true}
-      PRESIDIO_CONFIDENCE_THRESHOLD: ${PRESIDIO_CONFIDENCE_THRESHOLD:-0.8}
-      PRESIDIO_LANGUAGE: ${PRESIDIO_LANGUAGE:-ru}
-
-      REGEX_ENABLED: ${REGEX_ENABLED:-true}
-
-      COMPOSITE_STRATEGY: ${COMPOSITE_STRATEGY:-priority}
-      COMPOSITE_DEDUPLICATE: ${COMPOSITE_DEDUPLICATE:-true}
-      COMPOSITE_MIN_CONFIDENCE: ${COMPOSITE_MIN_CONFIDENCE:-0.75}
-
-      MASKER_TOKEN_PREFIX: ${MASKER_TOKEN_PREFIX:-[}
-      MASKER_TOKEN_SUFFIX: ${MASKER_TOKEN_SUFFIX:-]}
-      MASKER_TOKEN_FORMAT: ${MASKER_TOKEN_FORMAT:-{type}_{index}}
-      MASKER_PRESERVE_CASE: ${MASKER_PRESERVE_CASE:-false}
-      MASKER_PRESERVE_LENGTH: ${MASKER_PRESERVE_LENGTH:-false}
-
-      PIPELINE_MAX_TEXT_LENGTH: ${PIPELINE_MAX_TEXT_LENGTH:-100000}
-      PIPELINE_MAX_ENTITIES_PER_REQUEST: ${PIPELINE_MAX_ENTITIES_PER_REQUEST:-500}
-      PIPELINE_LLM_TIMEOUT: ${PIPELINE_LLM_TIMEOUT:-25}
-      PIPELINE_TOTAL_TIMEOUT: ${PIPELINE_TOTAL_TIMEOUT:-28}
-      
-      PII_SANITIZATION: ${PII_SANITIZATION:-true}
-      UVICORN_WORKERS: ${UVICORN_WORKERS:-4}
-
+      - APP_HOST=0.0.0.0
+      - APP_PORT=8000
+      - UVICORN_WORKERS=${UVICORN_WORKERS:-6}
+      - LOG_LEVEL=INFO
+      - LOG_FORMAT=json
+      - LLM_API_KEY=${LLM_API_KEY}
+      - LLM_BASE_URL=${LLM_BASE_URL:-https://api.deepseek.com}
+      - LLM_MODEL=${LLM_MODEL:-deepseek-chat}
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      - REDIS_PASSWORD=${REDIS_PASSWORD:-}
+      - REDIS_SOCKET_TIMEOUT=0.2
+      - REDIS_SOCKET_CONNECT_TIMEOUT=0.2
+      # Ключ обязателен, без default. Memory fallback в этом контуре запрещён.
+      - PAYLOAD_STORE_KEY=${PAYLOAD_STORE_KEY:?PAYLOAD_STORE_KEY is required}
+      - PAYLOAD_STORE_ALLOW_MEMORY_FALLBACK=false
+      - PAYLOAD_STORE_TTL_SECONDS=3600
+      - RATE_LIMIT_ENABLED=true
+      - RATE_LIMIT_DEFAULT_RPS=1500
+      - RATE_LIMIT_BURST=2000
     depends_on:
       redis:
         condition: service_healthy
@@ -91,24 +56,7 @@ services:
     image: redis:7-alpine
 
     container_name: pii-gateway-redis
-
-    environment:
-      REDIS_PASSWORD: ${REDIS_PASSWORD:?REDIS_PASSWORD is required}
-
-    command:
-      - redis-server
-      - --appendonly
-      - "yes"
-      - --maxmemory
-      - 1gb
-      - --maxmemory-policy
-      - noeviction
-      - --requirepass
-      - ${REDIS_PASSWORD:?REDIS_PASSWORD is required}
-
-    expose:
-      - "6379"
-
+    command: redis-server --appendonly yes --maxmemory 1gb --maxmemory-policy noeviction
     volumes:
       - redis_data:/data
 
@@ -133,8 +81,4 @@ services:
 volumes:
   pii_logs:
   redis_data:
-
-networks:
-  server_net:
-    name: server_net
-    external: true  # Раскомментируй эту строку, если сеть 'server_net' создается вручную вне этого docker-compose
+  pii_logs:

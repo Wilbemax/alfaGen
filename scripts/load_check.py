@@ -380,6 +380,43 @@ def _count_failure(report: LoadReport, outcome: Outcome, *, phase: str) -> None:
         setattr(report, field_name, getattr(report, field_name) + 1)
 
 
+def _record_result(
+    report: LoadReport,
+    result: _RoundtripResult,
+    mask_latencies: list[float],
+    demask_latencies: list[float],
+    roundtrip_latencies: list[float],
+) -> None:
+    """Aggregate a completed chain immediately instead of retaining response bodies."""
+    report.completed_roundtrips += 1
+    report.mask_logical_completed += 1
+    report.mask_http_attempts += result.mask.attempts
+    mask_latencies.append(result.mask_latency)
+    report.retried_requests += int(result.mask.attempts > 1)
+    if result.mask.kind == "success":
+        report.mask_success += 1
+    else:
+        _count_failure(report, result.mask, phase="mask")
+    if result.demask is None or result.demask_latency is None:
+        return
+    report.demask_logical_scheduled += 1
+    report.demask_logical_started += 1
+    report.demask_logical_completed += 1
+    report.demask_http_attempts += result.demask.attempts
+    demask_latencies.append(result.demask_latency)
+    if result.roundtrip_latency is not None:
+        roundtrip_latencies.append(result.roundtrip_latency)
+    report.retried_requests += int(result.demask.attempts > 1)
+    if result.demask.kind == "success":
+        report.demask_success += 1
+        if result.mismatch:
+            report.demask_mismatches += 1
+        else:
+            report.successful_roundtrips += 1
+    else:
+        _count_failure(report, result.demask, phase="demask")
+
+
 async def run_load(
     config: LoadConfig, *, transport: httpx.AsyncBaseTransport | None = None,
     clock: Clock | None = None,
@@ -410,7 +447,6 @@ async def _execute(
     mask_latencies: list[float] = []
     demask_latencies: list[float] = []
     roundtrip_latencies: list[float] = []
-    results: list[_RoundtripResult] = []
     tasks: set[asyncio.Task[_RoundtripResult]] = set()
 
     async with httpx.AsyncClient(
@@ -449,7 +485,13 @@ async def _execute(
         def collect(task: asyncio.Task[_RoundtripResult]) -> None:
             tasks.discard(task)
             if not task.cancelled() and task.exception() is None:
-                results.append(task.result())
+                _record_result(
+                    report,
+                    task.result(),
+                    mask_latencies,
+                    demask_latencies,
+                    roundtrip_latencies,
+                )
 
         for index in range(report.scheduled_roundtrips):
             if state.stop:
@@ -495,34 +537,6 @@ async def _execute(
                 with contextlib.suppress(asyncio.CancelledError):
                     await drain
         report.elapsed_seconds = max(clock.monotonic() - run_started, config.duration, 1e-9)
-
-    for result in results:
-        report.completed_roundtrips += 1
-        report.mask_logical_completed += 1
-        report.mask_http_attempts += result.mask.attempts
-        mask_latencies.append(result.mask_latency)
-        report.retried_requests += int(result.mask.attempts > 1)
-        if result.mask.kind == "success":
-            report.mask_success += 1
-        else:
-            _count_failure(report, result.mask, phase="mask")
-        if result.demask is not None and result.demask_latency is not None:
-            report.demask_logical_scheduled += 1
-            report.demask_logical_started += 1
-            report.demask_logical_completed += 1
-            report.demask_http_attempts += result.demask.attempts
-            demask_latencies.append(result.demask_latency)
-            if result.roundtrip_latency is not None:
-                roundtrip_latencies.append(result.roundtrip_latency)
-            report.retried_requests += int(result.demask.attempts > 1)
-            if result.demask.kind == "success":
-                report.demask_success += 1
-                if result.mismatch:
-                    report.demask_mismatches += 1
-                else:
-                    report.successful_roundtrips += 1
-            else:
-                _count_failure(report, result.demask, phase="demask")
 
     report.mask_logical_scheduled = report.scheduled_roundtrips
     report.mask_logical_started = report.started_roundtrips
@@ -621,6 +635,18 @@ def config_from_args(args: argparse.Namespace) -> LoadConfig:
     )
 
 
+def run_from_cli(config: LoadConfig) -> LoadReport:
+    """Use uvloop when available, while retaining the Windows asyncio path."""
+    if sys.platform != "win32":
+        try:
+            import uvloop
+        except ImportError:
+            pass
+        else:
+            return uvloop.run(run_load(config))
+    return asyncio.run(run_load(config))
+
+
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
     timer_period_enabled = False
@@ -630,7 +656,7 @@ def main(argv: list[str] | None = None) -> int:
         # CLI run and restored in finally; pacing/drop semantics stay unchanged.
         timer_period_enabled = ctypes.windll.winmm.timeBeginPeriod(1) == 0
     try:
-        report = asyncio.run(run_load(config_from_args(args)))
+        report = run_from_cli(config_from_args(args))
     finally:
         if timer_period_enabled:
             ctypes.windll.winmm.timeEndPeriod(1)

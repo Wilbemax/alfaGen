@@ -2,12 +2,25 @@ from __future__ import annotations
 
 import asyncio
 import json
+import sys
 from collections import defaultdict
+from itertools import pairwise
+from types import SimpleNamespace
 
 import httpx
 import pytest
 
-from scripts.load_check import LoadConfig, VirtualClock, planned_slot_count, run_load
+from scripts.load_check import (
+    LoadConfig,
+    LoadReport,
+    Outcome,
+    VirtualClock,
+    _record_result,
+    _RoundtripResult,
+    planned_slot_count,
+    run_from_cli,
+    run_load,
+)
 
 pytestmark = pytest.mark.asyncio
 
@@ -68,7 +81,7 @@ async def test_roundtrips_are_evenly_paced_without_catch_up_burst() -> None:
     report = await run_load(_config(rps=5, duration=1), transport=transport, clock=clock)
     mask_starts = [stamp for phase, _pid, stamp in events if phase == "mask"]
     assert len(mask_starts) == 5
-    assert all(b - a >= 0.2 - 1e-9 for a, b in zip(mask_starts, mask_starts[1:]))
+    assert all(b - a >= 0.2 - 1e-9 for a, b in pairwise(mask_starts))
     assert report.pacing_drops == 0
 
 
@@ -90,6 +103,43 @@ async def test_roundtrip_and_http_rps_are_counted_separately() -> None:
     assert report.demask_http_rps == pytest.approx(4.0)
     assert report.total_http_rps == pytest.approx(8.0)
     assert report.http_attempts == 16
+
+
+async def test_completed_result_is_aggregated_without_a_result_buffer() -> None:
+    report = LoadReport(target_rps=1, duration=1, strict=True)
+    mask_latencies: list[float] = []
+    demask_latencies: list[float] = []
+    roundtrip_latencies: list[float] = []
+    _record_result(
+        report,
+        _RoundtripResult(
+            mask=Outcome("success", 200, "***"),
+            mask_latency=0.01,
+            demask=Outcome("success", 200, "source"),
+            demask_latency=0.02,
+            roundtrip_latency=0.03,
+        ),
+        mask_latencies,
+        demask_latencies,
+        roundtrip_latencies,
+    )
+    assert report.completed_roundtrips == report.successful_roundtrips == 1
+    assert report.mask_http_attempts == report.demask_http_attempts == 1
+    assert mask_latencies == [0.01]
+    assert demask_latencies == [0.02]
+    assert roundtrip_latencies == [0.03]
+
+
+async def test_cli_uses_uvloop_when_available(monkeypatch: pytest.MonkeyPatch) -> None:
+    expected = LoadReport(target_rps=1, duration=1, strict=False)
+
+    def fake_run(coroutine: object) -> LoadReport:
+        coroutine.close()  # type: ignore[attr-defined]
+        return expected
+
+    monkeypatch.setattr(sys, "platform", "linux")
+    monkeypatch.setitem(sys.modules, "uvloop", SimpleNamespace(run=fake_run))
+    assert run_from_cli(_config()) is expected
 
 
 async def test_mask_demask_and_full_roundtrip_latency_are_separate() -> None:
