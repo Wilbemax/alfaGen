@@ -14,9 +14,11 @@ from __future__ import annotations
 import argparse
 import asyncio
 import contextlib
+import ctypes
 import heapq
 import json
 import math
+import sys
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -621,7 +623,17 @@ def config_from_args(args: argparse.Namespace) -> LoadConfig:
 
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
-    report = asyncio.run(run_load(config_from_args(args)))
+    timer_period_enabled = False
+    if sys.platform == "win32":
+        # The default Windows timer quantum (~15.6 ms) caps an evenly paced
+        # open-loop generator near 128 starts/s. A 1 ms period is scoped to the
+        # CLI run and restored in finally; pacing/drop semantics stay unchanged.
+        timer_period_enabled = ctypes.windll.winmm.timeBeginPeriod(1) == 0
+    try:
+        report = asyncio.run(run_load(config_from_args(args)))
+    finally:
+        if timer_period_enabled:
+            ctypes.windll.winmm.timeEndPeriod(1)
     print_report(report)
     return 0 if report.passed else 1
 

@@ -11,7 +11,7 @@ services:
     environment:
       - APP_HOST=0.0.0.0
       - APP_PORT=8000
-      - UVICORN_WORKERS=${UVICORN_WORKERS:-1}
+      - UVICORN_WORKERS=${UVICORN_WORKERS:-4}
       - LOG_LEVEL=INFO
       - LOG_FORMAT=json
       - LLM_API_KEY=${LLM_API_KEY}

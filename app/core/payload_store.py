@@ -136,6 +136,7 @@ class PayloadStore:
                 password=settings.redis_password,
                 socket_timeout=settings.redis_socket_timeout,
                 socket_connect_timeout=settings.redis_socket_connect_timeout,
+                max_connections=settings.redis_max_connections,
                 decode_responses=False,
             )
             await client.ping()
@@ -169,20 +170,20 @@ class PayloadStore:
         if client is not None:
             await client.aclose()
 
-    async def put(self, scope: str, payload_id: str, record: PayloadRecord) -> None:
-        """Сохраняет запись (put-if-absent). Режим берётся только из initialize."""
+    async def put(self, scope: str, payload_id: str, record: PayloadRecord) -> bool:
+        """Сохраняет запись, если ключа ещё нет. False означает, что победила другая запись."""
         if self.mode == MODE_MEMORY:
-            self._put_local(scope, payload_id, record)
-            return
+            return self._put_local(scope, payload_id, record)
         redis, fernet = self._require_redis()
         key = self._redis_key(scope, payload_id)
         try:
             plaintext = json.dumps(record.to_dict(), ensure_ascii=False).encode("utf-8")
             ciphertext = fernet.encrypt(plaintext)
-            await redis.set(key, ciphertext, ex=int(self._ttl), nx=True)
+            created = await redis.set(key, ciphertext, ex=int(self._ttl), nx=True)
         except Exception as exc:
             logger.warning("Payload store write failed (%s)", type(exc).__name__)
             raise PayloadStoreError("Payload store write failed") from None
+        return bool(created)
 
     async def get(self, scope: str, payload_id: str) -> PayloadRecord | None:
         """Возвращает запись или None. В Redis-режиме local store не читается."""
@@ -244,12 +245,12 @@ class PayloadStore:
     def _memory_key(self, scope: str, payload_id: str) -> str:
         return normalize_scope(scope) + "\x00" + payload_id
 
-    def _put_local(self, scope: str, payload_id: str, record: PayloadRecord) -> None:
+    def _put_local(self, scope: str, payload_id: str, record: PayloadRecord) -> bool:
         memory_key = self._memory_key(scope, payload_id)
         with self._lock:
             # Идемпотентность: если ключ уже есть — не перезаписываем.
             if memory_key in self._records:
-                return
+                return False
             # Амортизированная очистка: полный проход по записям делаем не чаще,
             # чем раз в _evict_interval вставок. Корректность TTL обеспечивает
             # ленивая проверка в _get_local.
@@ -260,6 +261,7 @@ class PayloadStore:
             if len(self._records) >= self._max_entries and memory_key not in self._records:
                 self._evict_oldest_locked()
             self._records[memory_key] = record
+        return True
 
     def _get_local(self, scope: str, payload_id: str) -> PayloadRecord | None:
         memory_key = self._memory_key(scope, payload_id)

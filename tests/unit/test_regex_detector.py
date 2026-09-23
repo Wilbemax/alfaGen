@@ -103,15 +103,18 @@ async def test_regex_layer_does_not_detect_place_of_birth(regex_detector):
 
 
 @pytest.mark.asyncio
-async def test_regex_layer_does_not_detect_passport_issuer(regex_detector):
+async def test_regex_layer_detects_passport_issuer(regex_detector):
     matches = await regex_detector.detect("Орган выдавший паспорт: ОВД района Тверской")
-    assert not any(m.entity_type == "PASSPORT_ISSUER" for m in matches)
+    issuer = next(m for m in matches if m.entity_type == "PASSPORT_ISSUER")
+    assert issuer.text == "ОВД района Тверской"
 
 
 @pytest.mark.asyncio
-async def test_regex_layer_does_not_detect_person(regex_detector):
-    matches = await regex_detector.detect("иванов иван иванович")
-    assert not any(m.entity_type == "PERSON" for m in matches)
+async def test_regex_layer_detects_lowercase_person(regex_detector):
+    source = "иванов иван иванович"
+    matches = await regex_detector.detect(source)
+    person = next(m for m in matches if m.entity_type == "PERSON")
+    assert person.text == source
 
 
 @pytest.mark.asyncio
@@ -128,7 +131,10 @@ async def test_detect_date_in_words(regex_detector):
 
 @pytest.mark.asyncio
 async def test_historical_person_not_masked(regex_detector):
-    matches = await regex_detector.detect("Александр Сергеевич Пушкин родился в 1799 году")
+    from app.detectors.context_filter import ContextFilter
+
+    text = "Александр Сергеевич Пушкин родился в 1799 году"
+    matches = ContextFilter().filter(text, await regex_detector.detect(text))
     assert not any(m.entity_type == "PERSON" for m in matches)
 
 
@@ -296,9 +302,12 @@ async def test_place_of_birth_is_outside_regex_scope(regex_detector):
 
 
 @pytest.mark.asyncio
-async def test_passport_issuer_is_outside_regex_scope(regex_detector):
-    matches = await regex_detector.detect("Орган выдавший паспорт: ОВД района Тверской")
-    assert not any(m.entity_type == "PASSPORT_ISSUER" for m in matches)
+async def test_passport_issuer_span_excludes_label(regex_detector):
+    source = "Орган выдавший паспорт: ОВД района Тверской"
+    matches = await regex_detector.detect(source)
+    issuer = next(m for m in matches if m.entity_type == "PASSPORT_ISSUER")
+    assert issuer.text == "ОВД района Тверской"
+    assert source[issuer.start:issuer.end] == issuer.text
 
 
 @pytest.mark.asyncio
@@ -514,3 +523,40 @@ async def test_negative_passport_phrase_does_not_supply_context(regex_detector):
         "Заказ 4510 223344 без слова паспорт не является документом"
     )
     assert not any(item.entity_type == "PASSPORT" for item in matches)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("source", "value"),
+    [
+        ("Формат с точками 1992.04.17 сохранён.", "1992.04.17"),
+        ("Порядок год-день-месяц 1994.28.02.", "1994.28.02"),
+        ("Текст даты: 9 марта 1988 года.", "9 марта 1988 года"),
+        ("Необычные пробелы 07. 08. 1988 оставлены как в анкете.", "07. 08. 1988"),
+    ],
+)
+async def test_birth_dates_without_keyword_keep_exact_span(regex_detector, source, value):
+    matches = await regex_detector.detect(source)
+    match = next(item for item in matches if item.entity_type == "DATE_OF_BIRTH")
+    assert match.text == value
+    assert source[match.start:match.end] == value
+
+
+@pytest.mark.asyncio
+async def test_lowercase_fio_with_patronymic(regex_detector):
+    source = "в нижнем регистре кузнецова мария олеговна ждёт ответ."
+    value = "кузнецова мария олеговна"
+    matches = await regex_detector.detect(source)
+    match = next(item for item in matches if item.entity_type == "PERSON")
+    assert match.text == value
+    assert (match.start, match.end) == (source.index(value), source.index(value) + len(value))
+
+
+@pytest.mark.asyncio
+async def test_issuer_without_issued_keyword(regex_detector):
+    source = "Штамп ОУФМС России по г. Перми читается."
+    value = "ОУФМС России по г. Перми"
+    matches = await regex_detector.detect(source)
+    match = next(item for item in matches if item.entity_type == "PASSPORT_ISSUER")
+    assert match.text == value
+    assert source[match.start:match.end] == value

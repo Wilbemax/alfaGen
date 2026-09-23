@@ -43,11 +43,16 @@ def setup_logging() -> None:
     root.addHandler(console_handler)
     root._pii_gateway_configured = True
 
-    # Логгеры приложения наследуют root handler
-    for name in ("app", "uvicorn", "uvicorn.access", "uvicorn.error", "httpx", "redis"):
+    # Логгеры приложения наследуют root handler.
+    # Access-лог uvicorn дублирует request_end и на 1000 RPS занимает event loop.
+    for name in ("app", "uvicorn", "uvicorn.error", "httpx", "redis"):
         lg = logging.getLogger(name)
         lg.setLevel(level)
         lg.propagate = True
+    access = logging.getLogger("uvicorn.access")
+    access.handlers.clear()
+    access.propagate = False
+    access.setLevel(logging.WARNING)
 
 
 def _json_formatter() -> logging.Formatter:

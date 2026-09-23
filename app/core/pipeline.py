@@ -56,8 +56,9 @@ class Pipeline:
         logger.info("Pipeline initialized")
 
     async def close(self) -> None:
-        """Закрытие ресурсов хранилища."""
+        """Закрытие ресурсов хранилища. Следующий запрос инициализирует pipeline заново."""
         await self._store.close()
+        self._initialized = False
 
     def _get_profile(self, system_id: str | None) -> dict[str, Any]:
         """Профиль системы из pii_rules."""
@@ -85,26 +86,36 @@ class Pipeline:
         except PayloadStoreError:
             raise PipelineError("storage_error") from None
         if existing is not None:
-            if payload == existing.original_text:
-                # Ретрай маскирования: возвращаем ту же маску, не пересчитываем
-                self._log_entities("process_mask_retry", existing.entity_types, start_time, payload_id)
-                return existing.masked_text
-            if payload == existing.masked_text:
-                if profile.get("demask_enabled", False):
-                    # Демаскирование: возвращаем исходник
-                    self._log_entities("process_unmask", existing.entity_types, start_time, payload_id)
-                    return existing.original_text
-                # Демаскирование выключено: возвращаем маску
-                self._log_entities("process_mask_retry", existing.entity_types, start_time, payload_id)
-                return existing.masked_text
-            # Чужой текст с известным payload_id: возвращаем сохранённую маску
-            self._log_entities("process_mask_retry", existing.entity_types, start_time, payload_id)
-            return existing.masked_text
+            return self._answer_from_record(payload, existing, profile, start_time, payload_id)
 
-        # Новый payload_id: маскирование
-        result = await self._mask(payload, payload_id, profile, scope)
+        # Новый payload_id: маскирование. Если запись уже занял другой запрос,
+        # отвечаем по его паре, а не собственной маской.
+        result, winner = await self._mask(payload, payload_id, profile, scope)
+        if winner is not None:
+            return self._answer_from_record(payload, winner, profile, start_time, payload_id)
         self._log_entities("process_mask", result.entity_types, start_time, payload_id)
         return result.masked_text
+
+    def _answer_from_record(
+        self,
+        payload: str,
+        existing: PayloadRecord,
+        profile: dict[str, Any],
+        start_time: float,
+        payload_id: str,
+    ) -> str:
+        """Ответ по уже сохранённой паре. Чужой текст не перезаписывает запись."""
+        if payload == existing.original_text:
+            self._log_entities("process_mask_retry", existing.entity_types, start_time, payload_id)
+            return existing.masked_text
+        if payload == existing.masked_text:
+            if profile.get("demask_enabled", False):
+                self._log_entities("process_unmask", existing.entity_types, start_time, payload_id)
+                return existing.original_text
+            self._log_entities("process_mask_retry", existing.entity_types, start_time, payload_id)
+            return existing.masked_text
+        self._log_entities("process_mask_retry", existing.entity_types, start_time, payload_id)
+        return existing.masked_text
 
     def _log_entities(self, event: str, entity_types: list[str], start_time: float, payload_id: str) -> None:
         """Логирует типы найденных ПДн и их число. payload/result в лог не попадают."""
@@ -125,8 +136,11 @@ class Pipeline:
         payload_id: str,
         profile: dict[str, Any],
         scope: str,
-    ) -> MaskResult:
-        """Маскирование: детекция + маска + сохранение соответствия."""
+    ) -> tuple[MaskResult, PayloadRecord | None]:
+        """Маскирование: детекция + маска + сохранение соответствия.
+
+        Второй элемент — запись победителя, если SET NX не прошёл.
+        """
         allowed_types = profile.get("enabled_entity_types")
         if isinstance(allowed_types, list):
             allowed_types = set(allowed_types)
@@ -146,7 +160,7 @@ class Pipeline:
         observe_tokens(count_tokens(payload))
 
         try:
-            await self._store.put(
+            written = await self._store.put(
                 scope,
                 payload_id,
                 PayloadRecord(
@@ -157,7 +171,15 @@ class Pipeline:
             )
         except PayloadStoreError:
             raise PipelineError("storage_error") from None
-        return mask_result
+        if written:
+            return mask_result, None
+        try:
+            winner = await self._store.get(scope, payload_id)
+        except PayloadStoreError:
+            raise PipelineError("storage_error") from None
+        if winner is None:
+            return mask_result, None
+        return mask_result, winner
 
 
 # Глобальный экземпляр pipeline

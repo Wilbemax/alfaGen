@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 import re
@@ -21,7 +22,17 @@ logger = logging.getLogger(__name__)
 # (start, end, tag, confidence) в координатах переданного фрагмента.
 NerRunner = Callable[[str], list[tuple[int, int, str, float]]]
 
-_NAME_SIGNAL = re.compile(r"(?iu)(?<![\w])[а-яё]{2,}(?:\s+[а-яё]{2,})+")
+_CAPITALIZED_NAME_SIGNAL = re.compile(
+    r"(?u)(?<![\w])[А-ЯЁ][а-яё-]{1,}(?:\s+[А-ЯЁ][а-яё-]{1,})+"
+)
+_PATRONYMIC_NAME_SIGNAL = re.compile(
+    r"(?iu)(?<![\w])[а-яё-]{2,}\s+[а-яё-]{2,}\s+"
+    r"[а-яё-]*(?:ович|евич|овна|евна|ична|инична)(?![\w])"
+)
+_CONTEXT_NAME_SIGNAL = re.compile(
+    r"(?iu)(?<![\w])(?:заявитель|клиент|фио|на\s+имя)(?![\w])"
+    r"[^\n]{0,8}[а-яё-]{2,}\s+[а-яё-]{2,}"
+)
 _ADDRESS_SIGNAL = re.compile(
     r"(?iu)(?:проживает|адрес|индекс|улиц\w*|проспект\w*|город\w*"
     r"|корпус\w*|строени\w*|квартир\w*|област\w*|район\w*"
@@ -100,6 +111,9 @@ class NatashaDetector(BaseDetector):
         self._segmenter: Segmenter | None = None
         self._tagger: object | None = None
         self._doc_cls: type[Doc] | None = None
+        # Один NER job на worker предотвращает лавину thread-pool задач под
+        # open-loop нагрузкой. Другие async запросы продолжают обслуживаться.
+        self._ner_slots = asyncio.Semaphore(1)
 
     @property
     def name(self) -> str:
@@ -152,7 +166,10 @@ class NatashaDetector(BaseDetector):
         if deadline_monotonic is not None and time.monotonic() >= deadline_monotonic:
             return []
         try:
-            raw_spans = self._ner_runner(prepared)
+            # Natasha NER — CPU-bound и блокирует event loop. Выполняем в
+            # отдельном потоке, чтобы не сериализовать все запросы под нагрузкой.
+            async with self._ner_slots:
+                raw_spans = await asyncio.to_thread(self._ner_runner, prepared)
         except Exception:
             logger.warning("Natasha NER failed, entities omitted")
             return []
@@ -253,7 +270,15 @@ class NatashaDetector(BaseDetector):
 
     @staticmethod
     def _has_signal(text: str) -> bool:
-        return _NAME_SIGNAL.search(text) is not None or _ADDRESS_SIGNAL.search(text) is not None
+        folded = text.casefold()
+        return (
+            _CAPITALIZED_NAME_SIGNAL.search(text) is not None
+            or _PATRONYMIC_NAME_SIGNAL.search(text) is not None
+            or _CONTEXT_NAME_SIGNAL.search(text) is not None
+            or _ADDRESS_SIGNAL.search(text) is not None
+            or any(cue in folded for cue in _BIRTH_CUES)
+            or any(cue in folded for cue in _ISSUER_CUES)
+        )
 
 
 def _build_tagger() -> object:

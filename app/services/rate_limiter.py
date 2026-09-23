@@ -40,6 +40,7 @@ class RateLimiter:
                 password=settings.redis_password,
                 socket_timeout=settings.redis_socket_timeout,
                 socket_connect_timeout=settings.redis_socket_connect_timeout,
+                max_connections=settings.redis_max_connections,
                 decode_responses=True,
             )
             # Проверяем подключение
