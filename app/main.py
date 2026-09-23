@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING
 
 from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.responses import JSONResponse
+from starlette.responses import Response
 from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
 
 from app.config.settings import pii_rules
@@ -22,8 +23,6 @@ from app.models.request import (
 from app.services.rate_limiter import rate_limiter
 from app.utils.logging_setup import setup_logging
 
-if TYPE_CHECKING:
-    from starlette.responses import Response
 
 # Настраиваем логирование с санитизацией ПДн до создания приложения,
 # чтобы фильтр был активен для всех логгеров (включая uvicorn).
@@ -83,7 +82,6 @@ async def health() -> HealthResponse:
 @app.get("/metrics", tags=["metrics"])
 async def metrics() -> Response:
     """Prometheus metrics endpoint"""
-    from starlette.responses import Response
     return Response(
         content=generate_latest(),
         media_type=CONTENT_TYPE_LATEST,
