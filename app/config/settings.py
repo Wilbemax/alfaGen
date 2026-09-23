@@ -62,7 +62,6 @@ class AppSettings(BaseSettings):
     natasha_enabled: bool = True
     natasha_confidence_threshold: float = 0.85
     natasha_deadline_seconds: float = 0.3
-    natasha_max_chars: int = 8_000
     presidio_enabled: bool = True
     presidio_confidence_threshold: float = 0.8
     presidio_language: str = "ru"
@@ -80,7 +79,7 @@ class AppSettings(BaseSettings):
 
     # Pipeline
     pipeline_max_text_length: int = 100_000
-    pipeline_max_entities_per_request: int = 20_000
+    pipeline_max_entities_per_request: int = 500
     pipeline_llm_timeout: int = 25
     pipeline_total_timeout: int = 28
 

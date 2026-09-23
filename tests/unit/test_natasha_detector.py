@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import asyncio
 import sys
+import threading
 import time
 from types import ModuleType
 
@@ -166,6 +168,51 @@ async def test_card_only_skips_ner() -> None:
 
     assert matches == []
     assert calls == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "text",
+    [
+        "Телефон для связи +7 900 555-01-02 и почта olga.orlova@example.net",
+        "Дата рождения 03.11.1985, ИНН 500100732259",
+    ],
+)
+async def test_structured_fields_without_ner_signal_skip_runner(text: str) -> None:
+    calls: list[str] = []
+
+    def run(value: str) -> list[tuple[int, int, str, float]]:
+        calls.append(value)
+        return []
+
+    detector = NatashaDetector(ner_runner=run)
+    await detector.initialize()
+
+    assert await detector.detect(text) == []
+    assert calls == []
+
+
+@pytest.mark.asyncio
+async def test_concurrent_ner_jobs_are_bounded_per_worker(person_text: str) -> None:
+    lock = threading.Lock()
+    active = 0
+    peak = 0
+
+    def run(text: str) -> list[tuple[int, int, str, float]]:
+        nonlocal active, peak
+        with lock:
+            active += 1
+            peak = max(peak, active)
+        time.sleep(0.02)
+        with lock:
+            active -= 1
+        return [(0, len(text), "PER", 0.9)]
+
+    detector = NatashaDetector(ner_runner=run)
+    await detector.initialize()
+    await asyncio.gather(detector.detect(person_text), detector.detect(person_text))
+
+    assert peak == 1
 
 
 @pytest.mark.asyncio

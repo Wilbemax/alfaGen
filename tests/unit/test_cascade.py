@@ -127,3 +127,15 @@ async def test_cascade_without_natasha_returns_regex_only() -> None:
     result = await cascade.detect("ivan@example.com")
 
     assert [m.entity_type for m in result] == ["EMAIL"]
+
+
+@pytest.mark.asyncio
+async def test_long_text_still_calls_natasha() -> None:
+    regex = FakeRegexDetector([])
+    natasha = FakeNatashaDetector()
+    cascade = CascadeDetector(regex_detector=regex, natasha_detector=natasha)
+    await cascade.initialize()
+
+    await cascade.detect("Иванов Иван " + "текст " * 2_000)
+
+    assert natasha.deadline is not None

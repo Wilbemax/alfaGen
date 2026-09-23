@@ -25,7 +25,7 @@ import httpx
 if __name__ == "__main__":
     sys.path.insert(0, str(Path(__file__).parent.parent))
 
-DATASET_SHA256 = "fe3e145fcfc69d6f8a8e49eca8543ca7827155539ae502b02f283552689d0740"
+DATASET_SHA256 = "5ff155151f20e040b2cc8f6d5330516df170bc5078697edafe354f0dd1e848a6"
 
 REQUIRED_ENTITY_TYPES: frozenset[str] = frozenset(
     {

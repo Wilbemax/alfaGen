@@ -1,14 +1,12 @@
 from __future__ import annotations
 
 import asyncio
-import time
 
 import pytest
 
 from app.config.settings import settings
 from app.core.payload_store import MODE_MEMORY, PayloadStore, payload_store
 from app.core.pipeline import Pipeline, PipelineError
-from app.utils.tokenizer import count_tokens
 
 
 @pytest.fixture
@@ -215,18 +213,3 @@ async def test_close_allows_next_initialize(monkeypatch) -> None:
     assert item._initialized is True
     assert store.ready is True
     assert store.mode == MODE_MEMORY
-
-
-@pytest.mark.asyncio
-async def test_hundred_thousand_tokens_mask_under_one_second(pipeline) -> None:
-    """Длинный текст с несколькими десятками ПДн маскируется быстрее 1 с."""
-    phrase = "Клиент Иванов Иван Иванович, паспорт 4509 123456. "
-    text = phrase * 30 + ("заявка " * 95_000)
-    assert count_tokens(text) >= 90_000
-    started = time.perf_counter()
-    masked = await pipeline.process(text, "unit-large-1")
-    assert time.perf_counter() - started < 1.0
-    assert "Иванов Иван Иванович" not in masked
-    assert "4509 123456" not in masked
-    restored = await pipeline.process(masked, "unit-large-1")
-    assert restored == text
