@@ -1,6 +1,44 @@
-```gitignore
+# Local configuration and secrets
+.env
+.env.*
+!.env.example
+
+# Virtual environments
+.venv/
+venv/
+
+# Python generated files and packaging output
 __pycache__/
-*.pyc
-*.pyo
-*.pyd
-```.env
+*.py[cod]
+*.egg-info/
+build/
+dist/
+
+# Test and coverage output
+.pytest_cache/
+.coverage
+.coverage.*
+coverage.xml
+coverage.json
+htmlcov/
+
+# Runtime logs and temporary files
+*.log
+*.tmp
+*.bak
+*.swp
+request.json
+response.json
+retry.json
+restored.json
+huge-request*.json
+huge-response*.json
+
+# IDE and OS metadata
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+
+# Local assistant metadata
+.kilo/
