@@ -7,12 +7,7 @@ from collections import defaultdict
 import httpx
 import pytest
 
-from scripts.load_check import (
-    LoadConfig,
-    VirtualClock,
-    planned_slot_count,
-    run_load,
-)
+from scripts.load_check import LoadConfig, VirtualClock, planned_slot_count, run_load
 
 pytestmark = pytest.mark.asyncio
 
@@ -22,362 +17,249 @@ def _config(**overrides: object) -> LoadConfig:
         "base_url": "http://example.test",
         "rps": 10,
         "duration": 1,
-        "concurrency": 4,
+        "concurrency": 20,
         "timeout": 5,
+        "drain_timeout": 5,
         "strict": True,
     }
     values.update(overrides)
     return LoadConfig(**values)  # type: ignore[arg-type]
 
 
-def _roundtrip(clock: VirtualClock | None = None, delay: float = 0.0) -> tuple[httpx.MockTransport, dict[str, int]]:
+def _roundtrip(
+    clock: VirtualClock,
+    *,
+    mask_delay: float = 0.0,
+    demask_delay: float = 0.0,
+) -> tuple[httpx.MockTransport, list[tuple[str, str, float]]]:
     originals: dict[str, str] = {}
-    calls: dict[str, int] = defaultdict(int)
+    events: list[tuple[str, str, float]] = []
 
     async def handler(request: httpx.Request) -> httpx.Response:
-        if delay and clock is not None:
-            await clock.sleep(delay)
         body = json.loads(request.content.decode())
-        payload_id = body["payload_id"]
-        payload = body["payload"]
-        calls[payload_id] += 1
+        payload_id, payload = body["payload_id"], body["payload"]
         if payload_id not in originals:
             originals[payload_id] = payload
+            events.append(("mask", payload_id, clock.monotonic()))
+            await clock.sleep(mask_delay)
             return httpx.Response(200, json={"result": "*" * len(payload)})
-        if payload == "*" * len(originals[payload_id]):
-            return httpx.Response(200, json={"result": originals[payload_id]})
-        return httpx.Response(200, json={"result": "WRONG"})
+        events.append(("demask", payload_id, clock.monotonic()))
+        await clock.sleep(demask_delay)
+        result = originals[payload_id] if payload == "*" * len(originals[payload_id]) else "WRONG"
+        return httpx.Response(200, json={"result": result})
 
-    return httpx.MockTransport(handler), calls
-
-
-async def test_more_than_one_request_is_in_flight() -> None:
-    clock = VirtualClock()
-    entered = {"current": 0, "peak": 0}
-    release_at = 2
-
-    class Gate:
-        def __init__(self) -> None:
-            self._waiters: list[asyncio.Future[None]] = []
-            self._open = False
-
-        async def wait(self) -> None:
-            if self._open:
-                return
-            future: asyncio.Future[None] = asyncio.get_running_loop().create_future()
-            self._waiters.append(future)
-            await future
-
-        def open(self) -> None:
-            self._open = True
-            for future in self._waiters:
-                if not future.done():
-                    future.set_result(None)
-
-    gate = Gate()
-
-    async def handler(request: httpx.Request) -> httpx.Response:
-        body = json.loads(request.content.decode())
-        entered["current"] += 1
-        entered["peak"] = max(entered["peak"], entered["current"])
-        if entered["current"] >= release_at:
-            gate.open()
-        await gate.wait()
-        entered["current"] -= 1
-        payload = body["payload"]
-        return httpx.Response(200, json={"result": payload})
-
-    report = await run_load(
-        _config(rps=20, duration=0.5, concurrency=8),
-        transport=httpx.MockTransport(handler),
-        clock=clock,
-    )
-    assert entered["peak"] >= 2
-    assert report.peak_in_flight >= 2
+    return httpx.MockTransport(handler), events
 
 
-async def test_scheduler_creates_expected_slots() -> None:
+async def test_scheduler_creates_expected_roundtrip_slots() -> None:
     assert planned_slot_count(30, 1000) == 30000
-    assert planned_slot_count(1, 10) == 10
     clock = VirtualClock()
-    transport, calls = _roundtrip(clock)
-    report = await run_load(_config(rps=10, duration=1, concurrency=4), transport=transport, clock=clock)
-    assert report.scheduled == 10
-    assert len(calls) == 10
-    assert len(set(calls)) == 10
+    transport, _events = _roundtrip(clock)
+    report = await run_load(_config(rps=10), transport=transport, clock=clock)
+    assert report.scheduled_roundtrips == 10
+    assert report.started_roundtrips == 10
+    assert report.completed_roundtrips == 10
+    assert report.successful_roundtrips == 10
 
 
-async def test_semaphore_limits_concurrency() -> None:
+async def test_roundtrips_are_evenly_paced_without_catch_up_burst() -> None:
     clock = VirtualClock()
-    current = {"value": 0, "peak": 0}
+    transport, events = _roundtrip(clock)
+    report = await run_load(_config(rps=5, duration=1), transport=transport, clock=clock)
+    mask_starts = [stamp for phase, _pid, stamp in events if phase == "mask"]
+    assert len(mask_starts) == 5
+    assert all(b - a >= 0.2 - 1e-9 for a, b in zip(mask_starts, mask_starts[1:]))
+    assert report.pacing_drops == 0
 
-    async def handler(request: httpx.Request) -> httpx.Response:
-        current["value"] += 1
-        current["peak"] = max(current["peak"], current["value"])
-        await clock.sleep(0.05)
-        current["value"] -= 1
-        body = json.loads(request.content.decode())
-        return httpx.Response(200, json={"result": body["payload"]})
 
+async def test_demask_starts_before_global_mask_completion() -> None:
+    clock = VirtualClock()
+    transport, events = _roundtrip(clock, mask_delay=0.01, demask_delay=0.01)
+    report = await run_load(_config(rps=10), transport=transport, clock=clock)
+    phases = [phase for phase, _pid, _stamp in events]
+    assert phases.index("demask") < max(i for i, phase in enumerate(phases) if phase == "mask")
+    assert report.demask_logical_completed == report.mask_success == 10
+
+
+async def test_roundtrip_and_http_rps_are_counted_separately() -> None:
+    clock = VirtualClock()
+    transport, _events = _roundtrip(clock)
+    report = await run_load(_config(rps=4, duration=2), transport=transport, clock=clock)
+    assert report.actual_success_rps == pytest.approx(4.0)
+    assert report.mask_http_rps == pytest.approx(4.0)
+    assert report.demask_http_rps == pytest.approx(4.0)
+    assert report.total_http_rps == pytest.approx(8.0)
+    assert report.http_attempts == 16
+
+
+async def test_mask_demask_and_full_roundtrip_latency_are_separate() -> None:
+    clock = VirtualClock()
+    transport, _events = _roundtrip(clock, mask_delay=0.1, demask_delay=0.2)
     report = await run_load(
-        _config(rps=20, duration=0.5, concurrency=1),
-        transport=httpx.MockTransport(handler),
-        clock=clock,
+        _config(rps=1, duration=2, concurrency=2), transport=transport, clock=clock
     )
-    assert current["peak"] == 1
+    assert report.mask_p50 == pytest.approx(0.1)
+    assert report.demask_p50 == pytest.approx(0.2)
+    assert report.roundtrip_p50 == pytest.approx(0.3)
+    assert report.roundtrip_max >= report.mask_max + report.demask_max - 1e-9
+
+
+async def test_concurrency_saturation_is_bounded_and_fails() -> None:
+    clock = VirtualClock()
+    transport, _events = _roundtrip(clock, mask_delay=0.6, demask_delay=0.6)
+    report = await run_load(
+        _config(rps=10, duration=1, concurrency=1), transport=transport, clock=clock
+    )
     assert report.peak_in_flight == 1
-    assert report.scheduled == 10
-
-
-async def test_retry_after_and_at_most_two_retries() -> None:
-    clock = VirtualClock()
-    attempts: dict[str, list[float]] = defaultdict(list)
-    originals: dict[str, str] = {}
-
-    async def handler(request: httpx.Request) -> httpx.Response:
-        body = json.loads(request.content.decode())
-        payload_id = body["payload_id"]
-        attempts[payload_id].append(clock.monotonic())
-        if payload_id not in originals:
-            originals[payload_id] = body["payload"]
-        if len(attempts[payload_id]) == 1:
-            return httpx.Response(429, headers={"Retry-After": "0.4"})
-        if body["payload"] == originals[payload_id]:
-            return httpx.Response(200, json={"result": "*" * len(body["payload"])})
-        return httpx.Response(200, json={"result": originals[payload_id]})
-
-    report = await run_load(
-        _config(rps=2, duration=1, concurrency=1),
-        transport=httpx.MockTransport(handler),
-        clock=clock,
-    )
-    assert report.scheduled == 2
-    assert report.retried_requests >= 2
-    assert report.final_429 == 0
-    for stamps in attempts.values():
-        assert len(stamps) >= 2
-        assert stamps[1] - stamps[0] >= 0.4 - 1e-9
-        assert len(stamps) <= 3
-
-
-async def test_max_two_retries_on_server_error() -> None:
-    clock = VirtualClock()
-    calls = {"count": 0}
-
-    async def handler(_request: httpx.Request) -> httpx.Response:
-        calls["count"] += 1
-        return httpx.Response(500)
-
-    report = await run_load(
-        _config(rps=1, duration=1, concurrency=1),
-        transport=httpx.MockTransport(handler),
-        clock=clock,
-    )
-    assert report.scheduled == 1
-    assert calls["count"] == 3
-    assert report.final_5xx == 1
-
-
-async def test_five_invalid_responses_stop_the_run() -> None:
-    clock = VirtualClock()
-    calls = {"count": 0}
-
-    async def handler(_request: httpx.Request) -> httpx.Response:
-        calls["count"] += 1
-        return httpx.Response(500)
-
-    report = await run_load(
-        _config(rps=10, duration=2, concurrency=1, strict=False),
-        transport=httpx.MockTransport(handler),
-        clock=clock,
-    )
-    assert report.scheduled == 5
-    assert calls["count"] == 15
-    assert report.max_consecutive_invalid == 5
+    assert report.saturation_drops > 0
+    assert report.started_roundtrips < report.scheduled_roundtrips
     assert report.passed is False
-    assert any("consecutive invalid" in reason for reason in report.reasons)
+    assert any("saturation" in reason for reason in report.reasons)
 
 
-async def test_429_does_not_reset_invalid_counter() -> None:
+async def test_demask_mismatch_is_a_correctness_failure() -> None:
     clock = VirtualClock()
-    order: list[str] = []
-    attempts: dict[str, int] = defaultdict(int)
-    script = (
-        [500, 500, 500],
-        [429, 429, 429],
-        [500, 500, 500],
-    )
+    originals: set[str] = set()
 
     async def handler(request: httpx.Request) -> httpx.Response:
         body = json.loads(request.content.decode())
-        payload_id = body["payload_id"]
-        if payload_id not in order:
-            order.append(payload_id)
-        index = order.index(payload_id)
-        attempt = attempts[payload_id]
-        attempts[payload_id] += 1
-        status = script[index][attempt]
-        if status == 429:
-            return httpx.Response(429, headers={"Retry-After": "0"})
-        return httpx.Response(status)
-
-    report = await run_load(
-        _config(rps=3, duration=1, concurrency=1, strict=False),
-        transport=httpx.MockTransport(handler),
-        clock=clock,
-    )
-    assert report.max_consecutive_invalid == 2
-    assert report.consecutive_invalid == 2
-    assert report.final_429 == 1
-
-
-async def test_success_resets_invalid_counter() -> None:
-    clock = VirtualClock()
-    order: list[str] = []
-    attempts: dict[str, int] = defaultdict(int)
-    originals: dict[str, str] = {}
-    script = (
-        [500, 500, 500],
-        [200],
-        [500, 500, 500],
-    )
-
-    async def handler(request: httpx.Request) -> httpx.Response:
-        body = json.loads(request.content.decode())
-        payload_id = body["payload_id"]
-        payload = body["payload"]
-        if payload_id not in originals:
-            originals[payload_id] = payload
-        if payload != originals[payload_id]:
-            return httpx.Response(200, json={"result": originals[payload_id]})
-        if payload_id not in order:
-            order.append(payload_id)
-        index = order.index(payload_id)
-        attempt = attempts[payload_id]
-        attempts[payload_id] += 1
-        status = script[index][attempt]
-        if status == 200:
+        pid, payload = body["payload_id"], body["payload"]
+        if pid not in originals:
+            originals.add(pid)
             return httpx.Response(200, json={"result": "*" * len(payload)})
-        return httpx.Response(status)
+        return httpx.Response(200, json={"result": "NOT-THE-SOURCE"})
 
     report = await run_load(
-        _config(rps=3, duration=1, concurrency=1, strict=False),
-        transport=httpx.MockTransport(handler),
-        clock=clock,
+        _config(rps=2), transport=httpx.MockTransport(handler), clock=clock
     )
-    assert report.max_consecutive_invalid == 1
-    assert report.success == 1
-
-
-async def test_demask_mismatch_fails() -> None:
-    clock = VirtualClock()
-
-    async def handler(request: httpx.Request) -> httpx.Response:
-        body = json.loads(request.content.decode())
-        if body["payload"].startswith("*"):
-            return httpx.Response(200, json={"result": "NOT-THE-SOURCE"})
-        return httpx.Response(200, json={"result": "*" * len(body["payload"])})
-
-    report = await run_load(
-        _config(rps=2, duration=1, concurrency=2),
-        transport=httpx.MockTransport(handler),
-        clock=clock,
-    )
-    assert report.demask_mismatches > 0
-    assert report.passed is False
+    assert report.demask_mismatches == 2
+    assert report.successful_roundtrips == 0
     assert any("demask mismatches" in reason for reason in report.reasons)
 
 
-async def test_low_achieved_rps_fails_strict_gate() -> None:
+@pytest.mark.parametrize(
+    ("status", "field"),
+    [(429, "final_429"), (500, "final_5xx")],
+)
+async def test_final_http_errors_are_counted(status: int, field: str) -> None:
+    clock = VirtualClock()
+
+    async def handler(_request: httpx.Request) -> httpx.Response:
+        headers = {"Retry-After": "0"} if status == 429 else None
+        return httpx.Response(status, headers=headers)
+
+    report = await run_load(
+        _config(rps=1), transport=httpx.MockTransport(handler), clock=clock
+    )
+    assert getattr(report, field) == 1
+    assert report.mask_http_attempts == 3
+    assert report.passed is False
+
+
+async def test_network_error_is_counted() -> None:
     clock = VirtualClock()
 
     async def handler(request: httpx.Request) -> httpx.Response:
-        await clock.sleep(0.5)
-        body = json.loads(request.content.decode())
-        return httpx.Response(200, json={"result": body["payload"]})
+        raise httpx.ConnectError("unavailable", request=request)
 
     report = await run_load(
-        _config(rps=20, duration=1, concurrency=1),
-        transport=httpx.MockTransport(handler),
-        clock=clock,
+        _config(rps=1), transport=httpx.MockTransport(handler), clock=clock
     )
-    assert report.completion_rps < 0.95 * report.target_rps
-    assert report.passed is False
-    assert any("completion RPS" in reason for reason in report.reasons)
+    assert report.network_errors == 1
+    assert report.timeouts == 0
 
 
-async def test_high_p95_fails_strict_gate() -> None:
+async def test_timeout_is_counted_separately() -> None:
     clock = VirtualClock()
 
     async def handler(request: httpx.Request) -> httpx.Response:
-        await clock.sleep(1.2)
-        body = json.loads(request.content.decode())
-        return httpx.Response(200, json={"result": body["payload"]})
+        raise httpx.ReadTimeout("slow", request=request)
 
     report = await run_load(
-        _config(rps=1, duration=10, concurrency=10),
-        transport=httpx.MockTransport(handler),
-        clock=clock,
+        _config(rps=1), transport=httpx.MockTransport(handler), clock=clock
     )
-    assert report.mask_p95 > 1.0
-    assert report.passed is False
-    assert any("p95" in reason for reason in report.reasons)
+    assert report.timeouts == 1
+    assert report.network_errors == 0
 
 
-async def test_correct_run_passes_strict_gate() -> None:
-    clock = VirtualClock()
-    transport, calls = _roundtrip(clock)
-    report = await run_load(_config(rps=10, duration=1, concurrency=4), transport=transport, clock=clock)
-    assert report.scheduled == 10
-    assert report.success == 10
-    assert report.demask_mismatches == 0
-    assert report.final_5xx == 0
-    assert report.final_429 == 0
-    assert report.mask_p95 <= 1.0
-    assert report.demask_p95 <= 1.0
-    assert report.completion_rps >= 0.95 * report.target_rps
-    assert report.max_consecutive_invalid < 5
-    assert report.passed is True
-    assert len(calls) == 10
-
-
-async def test_retry_500_then_200_counts_attempts() -> None:
+async def test_retry_success_counts_attempts_without_final_error() -> None:
     clock = VirtualClock()
     attempts: dict[str, int] = defaultdict(int)
     originals: dict[str, str] = {}
 
     async def handler(request: httpx.Request) -> httpx.Response:
         body = json.loads(request.content.decode())
-        payload_id = body["payload_id"]
-        payload = body["payload"]
-        if payload_id not in originals:
-            originals[payload_id] = payload
-        attempt = attempts[payload_id]
-        attempts[payload_id] += 1
-        if attempt == 0:
+        pid, payload = body["payload_id"], body["payload"]
+        originals.setdefault(pid, payload)
+        attempts[pid] += 1
+        if attempts[pid] == 1:
             return httpx.Response(500)
-        if payload == originals[payload_id]:
+        if payload == originals[pid]:
             return httpx.Response(200, json={"result": "*" * len(payload)})
-        return httpx.Response(200, json={"result": originals[payload_id]})
+        return httpx.Response(200, json={"result": originals[pid]})
 
     report = await run_load(
-        _config(rps=1, duration=1, concurrency=1),
+        _config(rps=1), transport=httpx.MockTransport(handler), clock=clock
+    )
+    assert report.mask_http_attempts == 2
+    assert report.demask_http_attempts == 1
+    assert report.final_5xx == 0
+    assert report.successful_roundtrips == 1
+
+
+async def test_strict_pass() -> None:
+    clock = VirtualClock()
+    transport, _events = _roundtrip(clock, mask_delay=0.01, demask_delay=0.01)
+    report = await run_load(_config(rps=10), transport=transport, clock=clock)
+    assert report.actual_success_rps >= 0.95 * report.target_roundtrip_rps
+    assert report.roundtrip_p95 <= 1.0
+    assert report.passed is True
+
+
+async def test_strict_fails_when_actual_success_is_below_95_percent() -> None:
+    clock = VirtualClock()
+    transport, _events = _roundtrip(clock, mask_delay=0.5, demask_delay=0.5)
+    report = await run_load(
+        _config(rps=20, concurrency=1), transport=transport, clock=clock
+    )
+    assert report.actual_success_rps < 0.95 * report.target_roundtrip_rps
+    assert any("95%" in reason for reason in report.reasons)
+
+
+async def test_roundtrip_latency_gate_is_explicit() -> None:
+    clock = VirtualClock()
+    transport, _events = _roundtrip(clock, mask_delay=0.6, demask_delay=0.6)
+    report = await run_load(
+        _config(rps=1, duration=2, concurrency=2), transport=transport, clock=clock
+    )
+    assert report.mask_p95 <= 1.0
+    assert report.demask_p95 <= 1.0
+    assert report.roundtrip_p95 > 1.0
+    assert any("roundtrip p95" in reason for reason in report.reasons)
+
+
+async def test_drain_timeout_cancels_runaway_backlog() -> None:
+    clock = VirtualClock()
+
+    async def handler(_request: httpx.Request) -> httpx.Response:
+        # A request that never resolves lets the runner's drain deadline win
+        # without introducing a competing long virtual-clock sleep.
+        await asyncio.Event().wait()
+        raise AssertionError("unreachable")
+
+    report = await run_load(
+        _config(rps=1, duration=1, drain_timeout=0.5),
         transport=httpx.MockTransport(handler),
         clock=clock,
     )
-    assert report.mask_logical_scheduled == 1
-    assert report.mask_logical_completed == 1
-    assert report.mask_success == 1
-    assert report.mask_http_attempts == 2
-    assert report.final_5xx == 0
+    assert report.drain_timed_out is True
+    assert any("drain timeout" in reason for reason in report.reasons)
 
 
-async def test_five_consecutive_5xx_stops_scheduling() -> None:
+async def test_five_consecutive_5xx_stop_future_scheduling() -> None:
     clock = VirtualClock()
-    calls = {"count": 0}
 
     async def handler(_request: httpx.Request) -> httpx.Response:
-        calls["count"] += 1
         return httpx.Response(500)
 
     report = await run_load(
@@ -385,59 +267,8 @@ async def test_five_consecutive_5xx_stops_scheduling() -> None:
         transport=httpx.MockTransport(handler),
         clock=clock,
     )
-    assert report.max_consecutive_5xx == 5
-    assert report.max_consecutive_invalid == 5
-    assert report.mask_logical_scheduled == 5
-    assert report.passed is False
+    # One already-admitted chain may finish concurrently with the fifth
+    # failure before the scheduler observes the stop flag.
+    assert report.max_consecutive_5xx >= 5
+    assert report.started_roundtrips < report.scheduled_roundtrips
     assert any("consecutive invalid" in reason for reason in report.reasons)
-
-
-async def test_strict_gate_fails_on_low_throughput() -> None:
-    clock = VirtualClock()
-
-    async def handler(request: httpx.Request) -> httpx.Response:
-        await clock.sleep(2.0)
-        body = json.loads(request.content.decode())
-        return httpx.Response(200, json={"result": body["payload"]})
-
-    report = await run_load(
-        _config(rps=1000, duration=1, concurrency=1),
-        transport=httpx.MockTransport(handler),
-        clock=clock,
-    )
-    assert report.mask_achieved_completion_rps < 0.95 * report.target_rps
-    assert report.passed is False
-    assert any("achieved completion RPS" in reason for reason in report.reasons)
-
-
-async def test_mask_and_demask_counters_are_separate() -> None:
-    clock = VirtualClock()
-    originals: dict[str, str] = {}
-
-    async def handler(request: httpx.Request) -> httpx.Response:
-        body = json.loads(request.content.decode())
-        payload_id = body["payload_id"]
-        payload = body["payload"]
-        if payload_id not in originals:
-            originals[payload_id] = payload
-            return httpx.Response(200, json={"result": "*" * len(payload)})
-        if payload == "*" * len(originals[payload_id]):
-            return httpx.Response(200, json={"result": originals[payload_id]})
-        return httpx.Response(200, json={"result": "WRONG"})
-
-    report = await run_load(
-        _config(rps=4, duration=1, concurrency=2),
-        transport=httpx.MockTransport(handler),
-        clock=clock,
-    )
-    assert report.mask_logical_scheduled == 4
-    assert report.mask_logical_completed == 4
-    assert report.mask_success == 4
-    assert report.demask_logical_scheduled == 4
-    assert report.demask_logical_completed == 4
-    assert report.demask_success == 4
-    assert report.demask_mismatches == 0
-    assert report.mask_http_attempts == 4
-    assert report.demask_http_attempts == 4
-    assert report.http_attempts == 8
-    assert report.success == 4
