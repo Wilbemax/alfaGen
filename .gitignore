@@ -1,26 +1,6 @@
-# Python
+```gitignore
 __pycache__/
-*.py[cod]
-*.egg-info/
-.eggs/
-build/
-dist/
-.venv/
-venv/
-env/
-
-# Test / tooling caches
-.pytest_cache/
-.ruff_cache/
-.coverage
-htmlcov/
-.mypy_cache/
-
-# Environment
-.env
-.env.local
-
-# IDE
-.idea/
-.vscode/
-*.swp
+*.pyc
+*.pyo
+*.pyd
+```.env
